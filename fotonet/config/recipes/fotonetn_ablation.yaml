@@ -1,0 +1,83 @@
+# FOTONET v1.1 ablation protocol: fotonetn on a fixed COCO subset.
+# Purpose: rank training ideas cheaply. A change is kept only if it adds
+# >= 0.3 mAP50-95, or reaches the baseline's final mAP with >= 15% fewer
+# images seen (see fotonet/versions/v1_1/ablation.py).
+# Build the subset first:
+#   python -m fotonet.versions.v1_1.ablation prepare data=coco.yaml out=runs/ablation/subset
+# Same layout and loss/matcher settings as fotonetn_scratch; shorter, smaller,
+# validated every 5 epochs on a 1000-image val subset.
+
+model: fotonetn
+pretrained: false
+resume: false
+
+train:
+  epochs: 40
+  imgsz: 512
+  imgsz_schedule: null
+  nbs: 128
+  batch: 16
+  workers: 4
+  predecode: false
+  close_mosaic: 5
+  out_dir: runs/ablation
+  lr_scheduler: wsd
+  wsd_decay_fraction: 0.20
+  grad_clip: 10.0
+  val_period: 5
+  val_batch: 16
+  val_workers: 2
+  best_metric: mAP50_95
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 2
+  ema_decay: 0.9995
+  ema_tau: 500
+
+augment:
+  mosaic: 0.90
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.562
+  fliplr: 0.606
+  flipud: 0.0
+  degrees: 1.11
+  shear: 1.46
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.106
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  iou_type: siou
+  quality_start_epoch: 2
+  quality_warmup_epochs: 4
+
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  # O2O winner: the O2M alignment metric scored on the O2O head (YOLOv10
+  # consistent matching), including O2M's early center-prior blend.
+  o2o_metric: consistent
+  # o2o_beta and o2o_center_prior apply only to o2o_metric: self (and to the
+  # O2O fallback when no anchor scores above zero).
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0

@@ -1,0 +1,841 @@
+import json
+from dataclasses import dataclass
+from enum import Enum
+
+import numpy as np
+import torch
+from PIL import Image
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
+
+
+@dataclass(frozen=True)
+class Vector2:
+    x: float
+    y: float
+
+    def __iter__(self):
+        yield self.x
+        yield self.y
+
+    def __getitem__(self, idx):
+        return (self.x, self.y)[idx]
+
+
+class AnchorPoint(Enum):
+    CENTER = "center"
+    DEFAULT = "center"
+    TOP_LEFT = "top_left"
+    TOP_RIGHT = "top_right"
+    BOTTOM_LEFT = "bottom_left"
+    BOTTOM_RIGHT = "bottom_right"
+    TOP = "top"
+    BOTTOM = "bottom"
+    LEFT = "left"
+    RIGHT = "right"
+
+
+def _normalize_anchor(anchor):
+    if isinstance(anchor, AnchorPoint):
+        return anchor
+    name = str(anchor).strip()
+    if name.lower().startswith("anchorpoint."):
+        name = name.split(".", 1)[1]
+    if name.upper() in AnchorPoint.__members__:
+        return AnchorPoint[name.upper()]
+    return AnchorPoint(name.lower())
+
+
+@dataclass(frozen=True)
+class FocusRegion:
+    x: float
+    y: float
+    w: float
+    h: float
+
+    def blend(self, other, alpha=0.5):
+        return FocusRegion(
+            self.x * (1.0 - alpha) + other.x * alpha,
+            self.y * (1.0 - alpha) + other.y * alpha,
+            self.w * (1.0 - alpha) + other.w * alpha,
+            self.h * (1.0 - alpha) + other.h * alpha,
+        )
+
+    def __truediv__(self, other):
+        return self.blend(other, 0.5)
+
+
+class _PointMap:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __getitem__(self, idx):
+        return self._fn(idx)
+
+
+class _FocusManager:
+    def __init__(self, transform):
+        self._transform = transform
+
+    def __call__(self, x, y, w, h):
+        region = FocusRegion(float(x), float(y), float(w), float(h))
+        self._transform._apply_focus(region)
+        return region
+
+    def reset(self):
+        self._transform.focus_reset()
+        return self._transform
+
+
+def _anchor_position_xyxy(xyxy, anchor):
+    x1, y1, x2, y2 = xyxy
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    if anchor == AnchorPoint.TOP_LEFT:
+        return x1, y1
+    if anchor == AnchorPoint.TOP_RIGHT:
+        return x2, y1
+    if anchor == AnchorPoint.BOTTOM_LEFT:
+        return x1, y2
+    if anchor == AnchorPoint.BOTTOM_RIGHT:
+        return x2, y2
+    if anchor == AnchorPoint.TOP:
+        return cx, y1
+    if anchor == AnchorPoint.BOTTOM:
+        return cx, y2
+    if anchor == AnchorPoint.LEFT:
+        return x1, cy
+    if anchor == AnchorPoint.RIGHT:
+        return x2, cy
+    return cx, cy
+
+
+class BoxTransform:
+    """Pure spatial utility layer over one detection box."""
+
+    def __init__(self, box_xywh, image_size):
+        self._source = np.asarray(box_xywh, dtype=np.float32).copy()
+        self._box = self._source.copy()
+        self._image_w, self._image_h = image_size
+        self._anchor = AnchorPoint.CENTER
+        self._focus_manager = _FocusManager(self)
+
+    @property
+    def anchor(self):
+        return self._anchor
+
+    @anchor.setter
+    def anchor(self, anchor):
+        self._anchor = _normalize_anchor(anchor)
+
+    @property
+    def focus(self):
+        return self._focus_manager
+
+    @focus.setter
+    def focus(self, region):
+        if isinstance(region, _FocusManager):
+            self._focus_manager = region
+            return
+        if region is None:
+            self.focus_reset()
+            return
+        if isinstance(region, FocusRegion):
+            self._apply_focus(region)
+            return
+        if isinstance(region, (tuple, list)) and len(region) == 4:
+            self._apply_focus(FocusRegion(*map(float, region)))
+            return
+        raise TypeError("focus must be a FocusRegion, (x, y, w, h), None, or focus manager.")
+
+    def _xyxy(self):
+        x, y, w, h = self._box
+        return np.array([x - w * 0.5, y - h * 0.5, x + w * 0.5, y + h * 0.5], dtype=np.float32)
+
+    def _set_xyxy(self, xyxy):
+        x1, y1, x2, y2 = np.asarray(xyxy, dtype=np.float32)
+        self._box = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5, max(x2 - x1, 0.0), max(y2 - y1, 0.0)], dtype=np.float32)
+
+    def _pixel_vec(self, v):
+        return Vector2(v.x * self._image_w, v.y * self._image_h)
+
+    @property
+    def xywh(self):
+        return tuple(float(v) for v in self._box)
+
+    @property
+    def xyxy(self):
+        return tuple(float(v) for v in self._xyxy())
+
+    @property
+    def position(self):
+        x, y = _anchor_position_xyxy(self._xyxy(), self.anchor)
+        return Vector2(float(x), float(y))
+
+    @property
+    def pixel_position(self):
+        return self._pixel_vec(self.position)
+
+    @property
+    def size(self):
+        return Vector2(float(self._box[2]), float(self._box[3]))
+
+    @property
+    def pixel_size(self):
+        return Vector2(float(self._box[2] * self._image_w), float(self._box[3] * self._image_h))
+
+    @property
+    def corner(self):
+        return _PointMap(self._corner)
+
+    @property
+    def pixel_corner(self):
+        return _PointMap(lambda idx: self._pixel_vec(self._corner(idx)))
+
+    @property
+    def side(self):
+        return _PointMap(self._side)
+
+    @property
+    def pixel_side(self):
+        return _PointMap(lambda idx: self._pixel_vec(self._side(idx)))
+
+    def _corner(self, idx):
+        x1, y1, x2, y2 = self._xyxy()
+        pts = {
+            1: Vector2(float(x1), float(y1)),
+            2: Vector2(float(x2), float(y1)),
+            3: Vector2(float(x2), float(y2)),
+            4: Vector2(float(x1), float(y2)),
+        }
+        return pts[int(idx)]
+
+    def _side(self, idx):
+        x1, y1, x2, y2 = self._xyxy()
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        pts = {
+            1: Vector2(float(cx), float(y1)),
+            2: Vector2(float(x2), float(cy)),
+            3: Vector2(float(cx), float(y2)),
+            4: Vector2(float(x1), float(cy)),
+        }
+        return pts[int(idx)]
+
+    def set_anchor(self, anchor):
+        self.anchor = anchor
+        return self
+
+    def move(self, delta):
+        dx, dy = delta if not isinstance(delta, Vector2) else (delta.x, delta.y)
+        self._box[0] += float(dx)
+        self._box[1] += float(dy)
+        return self
+
+    def pixel_move(self, delta):
+        dx, dy = delta if not isinstance(delta, Vector2) else (delta.x, delta.y)
+        return self.move(Vector2(float(dx) / self._image_w, float(dy) / self._image_h))
+
+    def _scale_about_anchor(self, sx, sy):
+        x1, y1, x2, y2 = self._xyxy()
+        ax, ay = _anchor_position_xyxy((x1, y1, x2, y2), self.anchor)
+        x1 = ax + (x1 - ax) * sx
+        x2 = ax + (x2 - ax) * sx
+        y1 = ay + (y1 - ay) * sy
+        y2 = ay + (y2 - ay) * sy
+        self._set_xyxy((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+
+    def scale(self, factor):
+        sx, sy = factor if not isinstance(factor, Vector2) else (factor.x, factor.y)
+        self._scale_about_anchor(float(sx), float(sy))
+        return self
+
+    def expand(self, padding):
+        p = float(padding)
+        x1, y1, x2, y2 = self._xyxy()
+        if self.anchor in (AnchorPoint.CENTER, AnchorPoint.TOP, AnchorPoint.BOTTOM):
+            x1 -= p
+            x2 += p
+        elif self.anchor in (AnchorPoint.LEFT, AnchorPoint.TOP_LEFT, AnchorPoint.BOTTOM_LEFT):
+            x2 += p
+        elif self.anchor in (AnchorPoint.RIGHT, AnchorPoint.TOP_RIGHT, AnchorPoint.BOTTOM_RIGHT):
+            x1 -= p
+        if self.anchor in (AnchorPoint.CENTER, AnchorPoint.LEFT, AnchorPoint.RIGHT):
+            y1 -= p
+            y2 += p
+        elif self.anchor in (AnchorPoint.TOP, AnchorPoint.TOP_LEFT, AnchorPoint.TOP_RIGHT):
+            y2 += p
+        elif self.anchor in (AnchorPoint.BOTTOM, AnchorPoint.BOTTOM_LEFT, AnchorPoint.BOTTOM_RIGHT):
+            y1 -= p
+        self._set_xyxy((x1, y1, x2, y2))
+        return self
+
+    def pixel_expand(self, padding):
+        p = float(padding)
+        px = p / max(float(self._image_w), 1e-9)
+        py = p / max(float(self._image_h), 1e-9)
+        x1, y1, x2, y2 = self._xyxy()
+        if self.anchor in (AnchorPoint.CENTER, AnchorPoint.TOP, AnchorPoint.BOTTOM):
+            x1 -= px
+            x2 += px
+        elif self.anchor in (AnchorPoint.LEFT, AnchorPoint.TOP_LEFT, AnchorPoint.BOTTOM_LEFT):
+            x2 += px
+        elif self.anchor in (AnchorPoint.RIGHT, AnchorPoint.TOP_RIGHT, AnchorPoint.BOTTOM_RIGHT):
+            x1 -= px
+        if self.anchor in (AnchorPoint.CENTER, AnchorPoint.LEFT, AnchorPoint.RIGHT):
+            y1 -= py
+            y2 += py
+        elif self.anchor in (AnchorPoint.TOP, AnchorPoint.TOP_LEFT, AnchorPoint.TOP_RIGHT):
+            y2 += py
+        elif self.anchor in (AnchorPoint.BOTTOM, AnchorPoint.BOTTOM_LEFT, AnchorPoint.BOTTOM_RIGHT):
+            y1 -= py
+        self._set_xyxy((x1, y1, x2, y2))
+        return self
+
+    def clamp(self):
+        x1, y1, x2, y2 = self._xyxy()
+        self._set_xyxy((np.clip(x1, 0, 1), np.clip(y1, 0, 1), np.clip(x2, 0, 1), np.clip(y2, 0, 1)))
+        return self
+
+    def set_box(self, mode=1):
+        x, y, w, h = self._box
+        width_px = w * self._image_w
+        height_px = h * self._image_h
+        side_px = min(width_px, height_px) if int(mode) == 0 else max(width_px, height_px)
+        self._box = np.array([x, y, side_px / self._image_w, side_px / self._image_h], dtype=np.float32)
+        return self
+
+    def set_aspect_ratio(self, ratio, mode=1):
+        rw, rh = ratio if not isinstance(ratio, Vector2) else (ratio.x, ratio.y)
+        target = max(float(rw), 1e-9) / max(float(rh), 1e-9)
+        x, y, w, h = self._box
+        width_px = w * self._image_w
+        height_px = h * self._image_h
+        if int(mode) == 0:
+            if width_px / max(height_px, 1e-9) > target:
+                width_px = height_px * target
+            else:
+                height_px = width_px / target
+        else:
+            if width_px / max(height_px, 1e-9) > target:
+                height_px = width_px / target
+            else:
+                width_px = height_px * target
+        self._box = np.array(
+            [x, y, width_px / self._image_w, height_px / self._image_h], dtype=np.float32
+        )
+        return self
+
+    def crop(self, image):
+        x1, y1, x2, y2 = self._xyxy()
+        px1 = int(np.clip(round(x1 * self._image_w), 0, self._image_w))
+        py1 = int(np.clip(round(y1 * self._image_h), 0, self._image_h))
+        px2 = int(np.clip(round(x2 * self._image_w), 0, self._image_w))
+        py2 = int(np.clip(round(y2 * self._image_h), 0, self._image_h))
+        if isinstance(image, Image.Image):
+            return image.crop((px1, py1, px2, py2))
+        return image[py1:py2, px1:px2].copy()
+
+    def contains(self, point=None, x=None, y=None, threshold=0.0):
+        x1, y1, x2, y2 = self._xyxy()
+        if point is not None:
+            px, py = point if not isinstance(point, Vector2) else (point.x, point.y)
+            return x1 <= px <= x2 and y1 <= py <= y2
+        zx1, zx2 = x if not isinstance(x, Vector2) else (x.x, x.y)
+        zy1, zy2 = y if not isinstance(y, Vector2) else (y.x, y.y)
+        ix = max(0.0, min(x2, zx2) - max(x1, zx1))
+        iy = max(0.0, min(y2, zy2) - max(y1, zy1))
+        area = max((x2 - x1) * (y2 - y1), 1e-9)
+        return (ix * iy) / area >= float(threshold)
+
+    def pixel_contains(self, point=None, x=None, y=None, threshold=0.0):
+        if point is not None:
+            px, py = point if not isinstance(point, Vector2) else (point.x, point.y)
+            return self.contains(Vector2(px / self._image_w, py / self._image_h))
+        zx1, zx2 = x if not isinstance(x, Vector2) else (x.x, x.y)
+        zy1, zy2 = y if not isinstance(y, Vector2) else (y.x, y.y)
+        return self.contains(x=Vector2(zx1 / self._image_w, zx2 / self._image_w),
+                             y=Vector2(zy1 / self._image_h, zy2 / self._image_h),
+                             threshold=threshold)
+
+    def overlaps(self, other):
+        return self.iou(other) > 0.0
+
+    def iou(self, other):
+        other_xyxy = other.xyxy if hasattr(other, "xyxy") else other.transform.xyxy
+        x1, y1, x2, y2 = self._xyxy()
+        ox1, oy1, ox2, oy2 = other_xyxy
+        inter = max(0.0, min(x2, ox2) - max(x1, ox1)) * max(0.0, min(y2, oy2) - max(y1, oy1))
+        area1 = max((x2 - x1) * (y2 - y1), 0.0)
+        area2 = max((ox2 - ox1) * (oy2 - oy1), 0.0)
+        return float(inter / max(area1 + area2 - inter, 1e-9))
+
+    def distance(self, point):
+        px, py = point if not isinstance(point, Vector2) else (point.x, point.y)
+        pos = self.position
+        return float(((pos.x - px) ** 2 + (pos.y - py) ** 2) ** 0.5)
+
+    def pixel_distance(self, point):
+        px, py = point if not isinstance(point, Vector2) else (point.x, point.y)
+        pos = self.pixel_position
+        return float(((pos.x - px) ** 2 + (pos.y - py) ** 2) ** 0.5)
+
+    def _apply_focus(self, region):
+        x1, y1, x2, y2 = self._xyxy()
+        bw = x2 - x1
+        bh = y2 - y1
+        # A focus region is expressed as x/y/w/h inside the source box. The
+        # stored representation is center-x/center-y/width/height.
+        fx = x1 + (region.x + region.w * 0.5) * bw
+        fy = y1 + (region.y + region.h * 0.5) * bh
+        fw = region.w * bw
+        fh = region.h * bh
+        self._box = np.array([fx, fy, fw, fh], dtype=np.float32)
+
+    def focus_reset(self):
+        self._box = self._source.copy()
+        return self
+
+
+class DetectionBox:
+    """One detection. ``cls`` is the class *name*; ``cls_id`` and ``label`` are explicit.
+
+    Values come from one host copy per result, so iterating detections of a CUDA
+    result costs a single device transfer instead of several per box.
+    """
+
+    def __init__(self, parent, idx):
+        self._parent = parent
+        self.idx = int(idx)
+        boxes, scores, classes, track_ids = parent._host()
+        self.conf = float(scores[self.idx])
+        self.cls_id = int(classes[self.idx])
+        self.cls = parent.names.get(self.cls_id, str(self.cls_id))
+        self.track_id = None if track_ids is None else int(track_ids[self.idx])
+        self.xywh = tuple(float(v) for v in boxes[self.idx])
+        self._transform = None
+
+    @property
+    def transform(self):
+        if self._transform is None:
+            self._transform = BoxTransform(self.xywh, self._parent.image_size)
+        return self._transform
+
+    @transform.setter
+    def transform(self, value):
+        self._transform = value
+
+    @property
+    def label(self):
+        return self.cls
+
+    @property
+    def xyxy(self):
+        if self._transform is not None:
+            return self._transform.xyxy
+        x, y, w, h = self.xywh
+        hw, hh = w * 0.5, h * 0.5
+        return (
+            float(np.float32(x - hw)),
+            float(np.float32(y - hh)),
+            float(np.float32(x + hw)),
+            float(np.float32(y + hh)),
+        )
+
+
+class DetectionBoxes:
+    def __init__(self, tensor, scores, classes, names=None, image_size=(640, 640), track_ids=None):
+        self.tensor = tensor.detach() if torch.is_tensor(tensor) else torch.as_tensor(tensor)
+        self.scores = scores.detach() if torch.is_tensor(scores) else torch.as_tensor(scores)
+        self.classes = classes.detach() if torch.is_tensor(classes) else torch.as_tensor(classes)
+        self.track_ids = None if track_ids is None else (
+            track_ids.detach() if torch.is_tensor(track_ids) else torch.as_tensor(track_ids)
+        )
+        self.names = names or {}
+        self.image_size = image_size
+        self._host_cache = None
+
+    def _host(self):
+        """(boxes, scores, classes, track_ids) as NumPy, transferred once."""
+        if self._host_cache is None:
+            self._host_cache = (
+                self.tensor.detach().float().cpu().numpy().reshape(-1, 4),
+                self.scores.detach().float().cpu().numpy().reshape(-1),
+                self.classes.detach().cpu().numpy().reshape(-1),
+                None if self.track_ids is None else self.track_ids.detach().cpu().numpy().reshape(-1),
+            )
+        return self._host_cache
+
+    # Batched tensor views, named as in other detection libraries.
+    @property
+    def conf(self):
+        """[N] confidence scores."""
+        return self.scores
+
+    @property
+    def cls(self):
+        """[N] class ids (a tensor; ``DetectionBox.cls`` is a single name)."""
+        return self.classes
+
+    @property
+    def id(self):
+        """[N] track ids, or None without tracking."""
+        return self.track_ids
+
+    @property
+    def xywhn(self):
+        """[N, 4] center x, center y, width, height, normalized to the image."""
+        return self.tensor
+
+    @property
+    def xyxyn(self):
+        """[N, 4] corners normalized to the image."""
+        t = self.tensor
+        if t.numel() == 0:
+            return t
+        return torch.stack((t[:, 0] - t[:, 2] * 0.5, t[:, 1] - t[:, 3] * 0.5,
+                            t[:, 0] + t[:, 2] * 0.5, t[:, 1] + t[:, 3] * 0.5), dim=-1)
+
+    @property
+    def data(self):
+        """[N, 6] pixel x1, y1, x2, y2, confidence, class id."""
+        xyxy = self.xyxy
+        if xyxy.numel() == 0:
+            return xyxy.new_zeros((0, 6))
+        return torch.cat((xyxy, self.scores.reshape(-1, 1).to(xyxy.dtype),
+                          self.classes.reshape(-1, 1).to(xyxy.dtype)), dim=1)
+
+    def __len__(self):
+        return int(self.tensor.shape[0])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield DetectionBox(self, i)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [DetectionBox(self, i) for i in range(*idx.indices(len(self)))]
+        return DetectionBox(self, idx)
+
+    def numpy(self):
+        return self.tensor.detach().cpu().numpy()
+
+    def to_tensor(self):
+        return self.tensor
+
+    @property
+    def xywh(self):
+        """Center-anchored [N, 4] boxes in pixels (scaled to the image)."""
+        t = self.tensor
+        if t.numel() == 0:
+            return t
+        img_w, img_h = self.image_size
+        scale = torch.tensor(
+            [float(img_w), float(img_h), float(img_w), float(img_h)],
+            dtype=t.dtype,
+            device=t.device,
+        )
+        return t * scale
+
+    @property
+    def xyxy(self):
+        """Corner [N, 4] boxes in pixels, matching the JSON export contract."""
+        t = self.tensor
+        if t.numel() == 0:
+            return t
+        cx, cy, w, h = t[:, 0], t[:, 1], t[:, 2], t[:, 3]
+        img_w, img_h = self.image_size
+        x1 = (cx - w * 0.5) * float(img_w)
+        y1 = (cy - h * 0.5) * float(img_h)
+        x2 = (cx + w * 0.5) * float(img_w)
+        y2 = (cy + h * 0.5) * float(img_h)
+        return torch.stack((x1, y1, x2, y2), dim=-1)
+
+    def find_biggest(self, cls=None):
+        return self._find_by_area(cls=cls, mode="max")
+
+    def find_smallest(self, cls=None):
+        return self._find_by_area(cls=cls, mode="min")
+
+    def find_average(self, cls=None):
+        items = self._filtered(cls)
+        if not items:
+            return None
+        areas = np.asarray([b.xywh[2] * b.xywh[3] for b in items], dtype=np.float32)
+        target = float(areas.mean())
+        return min(items, key=lambda b: abs((b.xywh[2] * b.xywh[3]) - target))
+
+    def _filtered(self, cls=None):
+        items = list(iter(self))
+        if cls is None:
+            return items
+        if isinstance(cls, str):
+            return [b for b in items if b.cls == cls]
+        return [b for b in items if b.cls_id == int(cls)]
+
+    def _find_by_area(self, cls=None, mode="max"):
+        items = self._filtered(cls)
+        if not items:
+            return None
+        key = lambda b: b.xywh[2] * b.xywh[3]
+        return max(items, key=key) if mode == "max" else min(items, key=key)
+
+
+class Results:
+    """Detection results for one image; result tensors are on the CPU by default."""
+
+    def __init__(self, orig_img, boxes, scores, classes, names=None, track_ids=None, orig_shape=None):
+        self.orig_img = orig_img
+        self.orig_shape = tuple(orig_shape[:2]) if orig_shape is not None else None
+        self.names = names or {}
+        self.scores = scores.detach() if torch.is_tensor(scores) else torch.as_tensor(scores)
+        self.classes = classes.detach() if torch.is_tensor(classes) else torch.as_tensor(classes)
+        self.track_ids = None if track_ids is None else (
+            track_ids.detach() if torch.is_tensor(track_ids) else torch.as_tensor(track_ids)
+        )
+        self.image_size = self._image_size(orig_img, self.orig_shape)
+        self.boxes = DetectionBoxes(
+            boxes, self.scores, self.classes, self.names, self.image_size, self.track_ids
+        )
+        self.boxes_tensor = self.boxes.tensor
+
+    def __len__(self):
+        """Return the number of detections in this image result.
+
+        This keeps a single ``Results`` object ergonomic in the same way as
+        the batch returned by :meth:`FOTONET.predict`: ``len(result)`` means
+        detections, while ``len(results)`` means images.
+        """
+        return len(self.boxes)
+
+    @staticmethod
+    def _image_size(img, orig_shape=None):
+        if orig_shape is not None:
+            h, w = orig_shape
+            return int(w), int(h)
+        if isinstance(img, Image.Image):
+            return img.size
+        h, w = getattr(img, "shape", (640, 640))[:2]
+        return int(w), int(h)
+
+    def _boxes_xyxy_px(self):
+        img_w, img_h = self.image_size
+        boxes = self.boxes.numpy()
+        if len(boxes) == 0:
+            return np.zeros((0, 4))
+        x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = (x - w / 2) * img_w
+        y1 = (y - h / 2) * img_h
+        x2 = (x + w / 2) * img_w
+        y2 = (y + h / 2) * img_h
+        return np.stack([x1, y1, x2, y2], axis=1)
+
+    @staticmethod
+    def _color(class_id):
+        """A stable, distinct RGB color per class."""
+        palette = (
+            (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29), (207, 210, 49),
+            (72, 249, 10), (146, 204, 23), (61, 219, 134), (26, 147, 52), (0, 212, 187),
+            (44, 153, 168), (0, 194, 255), (52, 69, 147), (100, 115, 255), (0, 24, 236),
+            (132, 56, 255), (82, 0, 133), (203, 56, 255), (255, 149, 200), (255, 55, 199),
+        )
+        return palette[int(class_id) % len(palette)]
+
+    def plot(self, show_conf=True, show_labels=True, line_width=None, colors=None):
+        if self.orig_img is None:
+            raise RuntimeError(
+                "This result was produced with retain_images=False, so plotting/cropping is unavailable. "
+                "Pass retain_images=True when calling predict() if you need pixels."
+            )
+        img = np.array(self.orig_img) if isinstance(self.orig_img, Image.Image) else self.orig_img.copy()
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+
+        try:
+            import cv2
+            xyxy = self._boxes_xyxy_px()
+            _, scores, classes, _ = self.boxes._host()
+            thickness = int(line_width) if line_width else max(round(sum(img.shape[:2]) / 600), 2)
+            for i, (x1, y1, x2, y2) in enumerate(xyxy):
+                c1, c2 = (int(x1), int(y1)), (int(x2), int(y2))
+                sc = float(scores[i])
+                cl = int(classes[i])
+                label = self.names.get(cl, str(cl))
+                # ``img`` is RGB, so colors are RGB triples here.
+                color = tuple(int(v) for v in (colors.get(cl) if isinstance(colors, dict) and cl in colors else self._color(cl)))
+                cv2.rectangle(img, c1, c2, color, thickness=thickness, lineType=cv2.LINE_AA)
+                if show_labels:
+                    txt = f"{label} {sc:.2f}" if show_conf else label
+                    tf = max(thickness - 1, 1)
+                    scale = thickness / 3
+                    t_size = cv2.getTextSize(txt, 0, fontScale=scale, thickness=tf)[0]
+                    c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+                    cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)
+                    cv2.putText(img, txt, (c1[0], c1[1] - 2), 0, scale, [255, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+            return img
+        except ImportError:
+            if _HAS_MPL:
+                fig, ax = plt.subplots(1)
+                ax.imshow(img)
+                xyxy = self._boxes_xyxy_px()
+                for i, (x1, y1, x2, y2) in enumerate(xyxy):
+                    rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2, edgecolor="r", facecolor="none")
+                    ax.add_patch(rect)
+                    if show_labels:
+                        label = self.names.get(int(self.classes[i]), str(int(self.classes[i])))
+                        text = f"{label} {float(self.scores[i]):.2f}" if show_conf else label
+                        ax.text(x1, y1, text, color="white", bbox={"facecolor": "red", "alpha": 0.7, "pad": 1})
+                plt.axis("off")
+                fig.canvas.draw()
+                plot_img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                plt.close(fig)
+                return plot_img
+            return img
+
+    def show(self, **kwargs):
+        plot_img = self.plot(**kwargs)
+        if _HAS_MPL:
+            plt.imshow(plot_img)
+            plt.axis("off")
+            plt.show()
+        else:
+            try:
+                import cv2
+                cv2.imshow("FOTO-NET Detection", cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR))
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+            except ImportError:
+                print("No visualization backend (matplotlib/opencv) found.")
+
+    def save(self, filename, **kwargs):
+        plot_img = self.plot(**kwargs)
+        import os
+        parent = os.path.dirname(os.fspath(filename))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        Image.fromarray(plot_img).save(filename)
+
+    def save_txt(self, filename, save_conf=False):
+        """Write YOLO-format lines: ``class cx cy w h [conf]``, normalized."""
+        import os
+
+        boxes, scores, classes, _ = self.boxes._host()
+        parent = os.path.dirname(os.fspath(filename))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(filename, "w", encoding="utf-8") as handle:
+            for box, score, cls in zip(boxes, scores, classes):
+                row = [str(int(cls))] + [f"{float(v):.6f}" for v in box]
+                if save_conf:
+                    row.append(f"{float(score):.6f}")
+                handle.write(" ".join(row) + "\n")
+        return filename
+
+    def save_crops(self, directory, stem="crop"):
+        """Save one image per detection under ``directory/<class name>/``."""
+        import os
+
+        if self.orig_img is None:
+            raise RuntimeError("This result has no pixels (retain_images=False); crops are unavailable.")
+        img = np.array(self.orig_img) if isinstance(self.orig_img, Image.Image) else self.orig_img
+        paths = []
+        _, _, classes, _ = self.boxes._host()
+        for i, (x1, y1, x2, y2) in enumerate(self._boxes_xyxy_px()):
+            x1, y1 = max(int(x1), 0), max(int(y1), 0)
+            x2, y2 = min(int(round(x2)), img.shape[1]), min(int(round(y2)), img.shape[0])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            name = str(self.names.get(int(classes[i]), int(classes[i]))).replace(os.sep, "_")
+            folder = os.path.join(os.fspath(directory), name)
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"{stem}_{i}.jpg")
+            Image.fromarray(np.ascontiguousarray(img[y1:y2, x1:x2])).save(path)
+            paths.append(path)
+        return paths
+
+    def to_dict(self):
+        """One dict per detection: class id, name, confidence, pixel box, track id."""
+        xyxy = self._boxes_xyxy_px()
+        _, scores, classes, track_ids = self.boxes._host()
+        return [
+            {
+                "class": int(classes[i]),
+                "name": self.names.get(int(classes[i]), str(int(classes[i]))),
+                "confidence": float(scores[i]),
+                "box": [float(v) for v in xyxy[i]],
+                "track_id": None if track_ids is None else int(track_ids[i]),
+            }
+            for i in range(len(self.boxes))
+        ]
+
+    summary = to_dict
+
+    def to_df(self):
+        return self.to_pandas()
+
+    def to_json(self):
+        xyxy = self._boxes_xyxy_px()
+        out = []
+        for i in range(len(self.boxes)):
+            cl = int(self.classes[i])
+            out.append({
+                "class": cl,
+                "name": self.names.get(cl, str(cl)),
+                "confidence": float(self.scores[i]),
+                "box": xyxy[i].tolist(),
+                "track_id": None if self.track_ids is None else int(self.track_ids[i]),
+            })
+        return json.dumps(out)
+
+    def to_pandas(self):
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("pandas required for to_pandas()")
+        xyxy = self._boxes_xyxy_px()
+        data = []
+        for i in range(len(self.boxes)):
+            cl = int(self.classes[i])
+            data.append({
+                "class": cl,
+                "name": self.names.get(cl, str(cl)),
+                "confidence": float(self.scores[i]),
+                "x1": xyxy[i, 0],
+                "y1": xyxy[i, 1],
+                "x2": xyxy[i, 2],
+                "y2": xyxy[i, 3],
+            })
+        return pd.DataFrame(data)
+
+    def __repr__(self):
+        return f"FOTONET Results: {len(self.boxes)} detections"
+
+    def cpu(self):
+        """Return a copy whose tensors live on CPU for NumPy/Pandas consumers."""
+        return Results(
+            self.orig_img,
+            self.boxes_tensor.cpu(),
+            self.scores.cpu(),
+            self.classes.cpu(),
+            self.names,
+            None if self.track_ids is None else self.track_ids.cpu(),
+            self.orig_shape,
+        )
+
+    def to(self, device):
+        """Return a copy moved to ``device`` without mutating the original result."""
+        return Results(
+            self.orig_img,
+            self.boxes_tensor.to(device),
+            self.scores.to(device),
+            self.classes.to(device),
+            self.names,
+            None if self.track_ids is None else self.track_ids.to(device),
+            self.orig_shape,
+        )

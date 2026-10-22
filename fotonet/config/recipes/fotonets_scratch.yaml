@@ -1,0 +1,90 @@
+# FOTONET v1.1 scratch recipe: fotonets.
+# Layout: stem 32, P2 64, widths 128/256/512, CSP-Star depths 1/2/4/2, attention at P5.
+# Deployed cost at 640 (fused, training-only heads removed): 11,492,956 params, 27.426 GFLOPs,
+# at least 1% under the YOLO27s gate (python -m fotonet.versions.v1_1.budget).
+# Direct LTRB regression. The deployed O2O head trains on detached features;
+# the training-only O2M head and its objectness branch teach the backbone.
+
+model: fotonets
+pretrained: false
+resume: false
+
+train:
+  epochs: 300
+  imgsz: 640
+  imgsz_schedule:
+    - [0.35, 512]
+    - [0.35, 576]
+    - [0.30, 640]
+  nbs: 128
+  batch: 16
+  workers: 4
+  predecode: false
+  close_mosaic: 15
+  out_dir: runs/train
+  lr_scheduler: wsd
+  wsd_decay_fraction: 0.20
+  grad_clip: 10.0
+  val_period: 1
+  val_batch: 8
+  val_workers: 2
+  best_metric: mAP50_95
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 3
+  ema_decay: 0.99985
+  ema_tau: 2000
+
+augment:
+  mosaic: 0.90
+  mixup: 0.05
+  copy_paste: 0.0
+  scale: 0.5
+  fliplr: 0.5
+  flipud: 0.0
+  degrees: 0.0
+  shear: 0.0
+  translate: 0.1
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  iou_type: siou
+  quality_start_epoch: 15
+  quality_warmup_epochs: 30
+
+# With the O2O head detached, O2M is the backbone's only teacher: every step,
+# never disabled.
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  # O2O winner: the O2M alignment metric scored on the O2O head (YOLOv10
+  # consistent matching), including O2M's early center-prior blend.
+  o2o_metric: consistent
+  # o2o_beta and o2o_center_prior apply only to o2o_metric: self (and to the
+  # O2O fallback when no anchor scores above zero).
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+
+smoke_limits:
+  epochs: 1
+  max_images: 256
+  imgsz: 640

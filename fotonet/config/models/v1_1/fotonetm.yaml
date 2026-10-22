@@ -1,0 +1,25 @@
+# fotonetm: fotonet v1.1 medium tier.
+# Deployed at 640 (fused, training-only heads removed): 22,232,876 params, 63.379 GFLOPs,
+# under the YOLO27m gate (22.8M params, 65.0 GFLOPs).
+# The architecture fingerprint hashes graph_version and this layout; editing a
+# value here makes a different model that cannot load this tier's weights.
+model_id: fotonetm
+generation: v1.1
+graph_version: 1.1.1
+layout:
+  stem_channels: 32
+  p2_channels: 96
+  widths: [192, 384, 576]
+  depths: [1, 4, 6, 3]  # CSP-Star blocks at P2, P3, P4, P5 (0 skips the stage block)
+  neck_channels: [192, 320, 512]
+  neck_depths: [2, 2, 1]
+  head_hidden: [96, 192]  # deployed head towers: regression, classification
+  attn_p5: 2
+  attn_p4: 1
+  head_levels: [3, 4, 5]
+# Parts this model is assembled from (name@major). graph_version 1.1.1 pins them.
+parts:
+  backbone: backbone.cspstar@1
+  neck: neck.pan_cspstar@1
+  head: head.o2o_o2m@1
+  blocks: [nn.conv@1, nn.repconv@1, nn.starblock@1, nn.cspstar@1, nn.sppf@1, nn.attention@1, nn.psa_block@1, nn.psa@1]

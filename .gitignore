@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+release-dist/
+
+# Datasets and training outputs
+datasets/
+logs/
+runs/
+wandb/
+tensorboard/
+.fotonet_cache/
+
+# Model weights and exported artifacts
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.mlpackage/
+*.mlmodel
+*.metadata.json
+
+# Media and temporary files
+*.mp4
+*.avi
+*.mov
+*.tmp
+*.temp
+*.bak
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
