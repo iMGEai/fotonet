@@ -123,8 +123,9 @@ def main(argv=None):
         # For a v1.1 id this chooses published weights vs. an untrained build.
         constructor["pretrained"] = bool(args.pop("pretrained"))
     if task in ("train", "info", "benchmark"):
-        # Training starts from an untrained build, and size and speed do not
-        # depend on the weights, so "predictions are meaningless" does not apply.
+        # Training fine-tunes from the released weights when they exist, and size
+        # and speed do not depend on the weights, so "predictions are meaningless"
+        # does not apply to these tasks.
         import warnings
 
         from fotonet.engine.model import UntrainedModelWarning

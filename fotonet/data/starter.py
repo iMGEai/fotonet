@@ -6,7 +6,7 @@ then works anywhere a data config is accepted.
 
 ``build_starter`` makes one locally from a COCO copy. ``resolve_starter``
 finds a built copy in the cache, or downloads the published archive once
-it exists (release asset ``v1.0.0/<name>.zip``; not published yet).
+it exists (release asset ``v1.1/<name>.zip``; not published yet).
 """
 from __future__ import annotations
 
@@ -96,11 +96,11 @@ def resolve_starter(name):
     if data_yaml.is_file():
         return str(data_yaml)
     if os.environ.get("FOTONET_OFFLINE", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        from fotonet.models.release import RELEASE_HOST, _download
+        from fotonet.models.release import RELEASE_HOST, V11_RELEASE_TAG, _download
 
         archive = root.with_suffix(".zip")
         try:
-            _download(f"{RELEASE_HOST}/v1.0.0/{name}.zip", archive)
+            _download(f"{RELEASE_HOST}/{V11_RELEASE_TAG}/{name}.zip", archive)
             with zipfile.ZipFile(archive) as bundle:
                 bundle.extractall(root)
             archive.unlink(missing_ok=True)

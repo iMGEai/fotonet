@@ -203,13 +203,27 @@ class TrainingMixin:
             self._apply_checkpoint_config(config)
             self.names = dict(checkpoint_names or data_names or default_class_names(checkpoint_nc))
             state = self._checkpoint_inference_state_dict(checkpoint)
-            self._load_model_state(state, inference_only=self._checkpoint_is_inference_only(checkpoint))
+            missing = self._load_model_state(state, inference_only=self._checkpoint_is_inference_only(checkpoint))
             self._ensure_training_o2m_heads(state, mirror=True)
+            if missing:
+                self._mirror_o2o_to_o2m()
+            self._loaded_missing_o2m = False
             self.loaded_weight_path = checkpoint_path
         else:
             if data_nc is not None and int(data_nc) != self.nc:
-                self.nc = int(data_nc)
-                self.model = self._new_model()
+                if self.loaded_weight_path:
+                    # Fine-tune onto new classes: keep every tensor whose shape
+                    # still fits, start only the class predictors fresh.
+                    kept, total = self._rebuild_for_classes(int(data_nc))
+                    print(f"[INFO] Fine-tuning from '{self.loaded_weight_path}': "
+                          f"{kept}/{total} tensors kept, nc={self.nc}.")
+                else:
+                    self.nc = int(data_nc)
+                    self.model = self._new_model()
+            if getattr(self, "_loaded_missing_o2m", False):
+                # Release checkpoints ship without the training-only O2M heads.
+                self._mirror_o2o_to_o2m()
+                self._loaded_missing_o2m = False
             if data_names is not None:
                 self.names = dict(data_names)
 

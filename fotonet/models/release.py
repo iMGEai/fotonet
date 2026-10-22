@@ -2,14 +2,16 @@
 
 Weight generations
 ------------------
-``fotonete``  -> generation 1 -> release ``v1.0.0``
-``fotonete2`` -> generation 2 -> release ``v2.0.0``
-``fotonet3``  -> ...          -> release ``v<generation>.0.0``
+``fotonete``  -> generation 1 -> release ``v1``
+``fotonete2`` -> generation 2 -> release ``v2``
+``fotonet3``  -> ...          -> release ``v<generation>``
+
+``fotonetn`` (the v1.1 family) lives in the ``v1.1`` release.
 
 Every generation is one graph with different trained weights, and each lives in
-its own ``v<generation>.0.0`` release. The package version on PyPI is unrelated
+its own ``v<generation>`` release. The package version on PyPI is unrelated
 to the weight generation: a user on fotonet 8.8.5 asking for ``fotonete`` still
-gets the weights published in the ``v1.0.0`` release.
+gets the weights published in the ``v1`` release.
 
 Why there is no checksum gate
 -----------------------------
@@ -44,8 +46,8 @@ CACHE_META_SUFFIX = ".meta.json"
 
 
 def release_tag(generation: int) -> str:
-    """Weight generations only ever publish as v<generation>.0.0."""
-    return f"v{int(generation)}.0.0"
+    """Weight generations publish as v<generation> (v1, v2, ...)."""
+    return f"v{int(generation)}"
 
 
 def release_url(generation: int) -> str:
@@ -159,11 +161,10 @@ def resolve_release_checkpoint(model_ref: str = "fotonete") -> Path:
     return cached
 
 # ---------------------------------------------------------------- v1.1 family
-# Proposed layout (plan decision D5): a v1.1 model's generation-1 weights are
-# the asset ``<model_id>.pt`` inside the existing ``v1.0.0`` release, so no new
-# tag is ever minted. Nothing is published there yet; until it is, resolution
-# returns None and the caller warns that the model is untrained.
-V11_RELEASE_TAG = "v1.0.0"
+# A v1.1 model's weights are the asset ``<model_id>.pt`` in the ``v1.1``
+# release (``fotonetn.pt`` today). A model with no published asset resolves to
+# None and the caller warns that it is untrained.
+V11_RELEASE_TAG = "v1.1"
 MISSING_TTL_SECONDS = 24 * 3600
 
 
@@ -188,12 +189,17 @@ def resolve_v11_release(model_id: str):
     cached = _cache_dir() / f"{model_id}.pt"
     if cached.is_file():
         return cached
+    url = v11_release_url(model_id)
     marker = cached.with_suffix(".pt.missing")
     if marker.is_file() and time.time() - marker.stat().st_mtime < MISSING_TTL_SECONDS:
-        return None
+        try:
+            # A miss only counts for the URL it was recorded against.
+            if marker.read_text(encoding="utf-8").strip() == url:
+                return None
+        except OSError:
+            pass
     if _offline():
         return None
-    url = v11_release_url(model_id)
     try:
         request = Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
         with urlopen(request, timeout=5) as response:

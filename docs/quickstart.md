@@ -1,8 +1,11 @@
 # Quick Start
 
-`Fotonet("fotonete")` loads the verified `fotonete.pt` checkpoint from the
-public `v1.0.0` GitHub release. The checkpoint is downloaded once, verified by
-SHA-256, and cached locally; it is not bundled in the Python package.
+`Fotonet("fotonetn")` loads `fotonetn.pt` from the `v1.1` GitHub release, and
+`Fotonet("fotonete")` loads `fotonete.pt` from the `v1` release. Each checkpoint
+is downloaded once and cached locally; neither is bundled in the Python package.
+
+Calling `train()` on either model fine-tunes from those weights. A different
+class count keeps the backbone and neck and starts only the class predictors fresh.
 
 ## Construct a Model
 

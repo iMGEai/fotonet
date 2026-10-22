@@ -502,10 +502,28 @@ class LoadingMixin:
         self._apply_checkpoint_config(config)
         state = self._checkpoint_inference_state_dict(checkpoint)
         inference_only = self._checkpoint_is_inference_only(checkpoint)
-        self._load_model_state(state, inference_only=inference_only)
+        missing = self._load_model_state(state, inference_only=inference_only)
+        self._loaded_missing_o2m = bool(missing)
         self.loaded_weight_path = path
         self._infer_cache = None
         return True
+
+    def _rebuild_for_classes(self, nc):
+        """Rebuild the graph for ``nc`` classes, keeping every tensor whose shape still fits."""
+        raw = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        incoming = raw.state_dict()
+        self.nc = int(nc)
+        self.model = self._new_model()
+        state = self.model.state_dict()
+        kept = 0
+        for key, value in state.items():
+            other = incoming.get(key)
+            if other is not None and tuple(other.shape) == tuple(value.shape):
+                state[key] = other.detach().to(device=value.device, dtype=value.dtype).clone()
+                kept += 1
+        self.model.load_state_dict(state, strict=True)
+        self._infer_cache = None
+        return kept, len(state)
 
     def _ensure_training_o2m_heads(self, source_state=None, mirror=False):
         raw = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
@@ -600,7 +618,8 @@ class LoadingMixin:
         self._apply_checkpoint_config(config)
         self.names = dict(checkpoint_names or default_class_names(checkpoint_nc))
         state = self._checkpoint_inference_state_dict(checkpoint)
-        self._load_model_state(state, inference_only=self._checkpoint_is_inference_only(checkpoint))
+        missing = self._load_model_state(state, inference_only=self._checkpoint_is_inference_only(checkpoint))
+        self._loaded_missing_o2m = bool(missing)
         self.loaded_weight_path = path
         self._infer_cache = None
         return self
