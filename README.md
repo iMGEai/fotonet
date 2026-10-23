@@ -1,5 +1,8 @@
 # fotonet
 
+
+![Turkey](https://img.shields.io/badge/Made%20in-Turkey-E30A17) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white) ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
+
 `fotonet` is an open-source, NMS-free object-detection library for Python covering local inference, video tracking, training, validation, and model export.
 
 ## Models
