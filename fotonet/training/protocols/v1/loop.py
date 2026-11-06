@@ -134,7 +134,7 @@ class TrainingLoopMixin:
             if "train" not in self.data_cfg or "val" not in self.data_cfg:
                 raise ValueError(
                     "Configured validation requires both 'train' and 'val' in the data config. "
-                    "FOTONET never falls back to evaluating the training set."
+                    "fotonet never falls back to evaluating the training set."
                 )
             if dataset is None:
                 self.full_train_set = build_detection_dataset(

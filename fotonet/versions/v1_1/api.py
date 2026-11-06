@@ -1,4 +1,4 @@
-"""Fotonet v1.1 checkpoint, export, and Python API."""
+"""fotonet v1.1 checkpoint, export, and Python API."""
 from __future__ import annotations
 
 import copy
@@ -26,10 +26,22 @@ def load_checkpoint(path, map_location="cpu"):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except Exception as exc:
-        raise ValueError(
-            f"Could not safely load {os.fspath(path)!r}; fotonet checkpoints must contain "
-            "tensors and plain Python values only."
-        ) from exc
+        raise checkpoint_load_error(path, exc) from exc
+
+
+def checkpoint_load_error(path, exc):
+    """Say why a checkpoint did not load: refused content, or a damaged or cut-off file."""
+    text = str(exc)
+    if "weights_only" in text or "Unsupported global" in text or "Weights only load failed" in text:
+        return ValueError(f"Could not safely load {os.fspath(path)!r}: fotonet checkpoints must contain "
+                          "tensors and plain Python values only.")
+    if not os.path.isfile(path):
+        why = "the file does not exist"
+    elif os.path.getsize(path) == 0:
+        why = "the file is empty"
+    else:
+        why = f"the file is damaged or was not fully written ({type(exc).__name__}: {text[:120]})"
+    return ValueError(f"Could not load {os.fspath(path)!r}: {why}.")
 
 
 def is_v11_checkpoint(ckpt):

@@ -1,8 +1,8 @@
 """
-Fotonet Studio CLI Bridge (fotonet.cli.studio_bridge)
+fotonet Studio CLI Bridge (fotonet.cli.studio_bridge)
 =====================================================
-Line-delimited JSON IPC bridge connecting Fotonet Studio (desktop/fotonet-studio)
-to the Fotonet v1.1 computer vision engine.
+Line-delimited JSON IPC bridge connecting fotonet Studio (desktop/fotonet-studio)
+to the fotonet v1.1 computer vision engine.
 
 Protocol Contract:
 - Telemetry events: {"type": "telemetry", "data": {...}}
@@ -10,7 +10,7 @@ Protocol Contract:
 - Error events:      {"type": "error", "message": "...", "traceback": "..."}
 
 Strict Architectural Governance:
-- Supports exclusively Fotonet v1.1 family (fotonetn, fotonets, fotonetm, fotonetl).
+- Supports exclusively fotonet v1.1 family (fotonetn, fotonets, fotonetm, fotonetl).
 - Absolute ban on internal numeric architecture counters in user-facing surfaces.
 - Zero dependencies on external YOLO packages (e.g. ultralytics).
 - Bit-exact numerical parity verification (L1 error < 1e-5) on ONNX export.
@@ -45,10 +45,10 @@ from .export import cmd_codegen, cmd_export  # noqa: F401
 # ============================================================================
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the command-line argument parser for Fotonet Studio CLI Bridge."""
+    """Build the command-line argument parser for fotonet Studio CLI Bridge."""
     parser = argparse.ArgumentParser(
         prog="python -m fotonet.cli.studio_bridge",
-        description="Fotonet Studio IPC Bridge for Fotonet v1.1 engine",
+        description="fotonet Studio IPC Bridge for fotonet v1.1 engine",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -93,8 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_abatch.add_argument("--dst", help="Destination directory")
 
     # 8. autolabel
-    p_auto = subparsers.add_parser("autolabel", help="Auto-labeling using Fotonet v1.1 direct LTRB head")
-    p_auto.add_argument("--model", required=True, help="Fotonet v1.1 model ID or checkpoint path")
+    p_auto = subparsers.add_parser("autolabel", help="Auto-labeling using fotonet v1.1 direct LTRB head")
+    p_auto.add_argument("--model", required=True, help="fotonet v1.1 model ID or checkpoint path")
     p_auto.add_argument("--images", required=True, help="Directory containing images")
     p_auto.add_argument("--conf", type=float, default=0.50, help="Confidence threshold")
     p_auto.add_argument("--save", action="store_true", help="Save YOLO .txt labels")
@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 10. predict
     p_pred = subparsers.add_parser("predict", help="Live detection with latency profiling")
-    p_pred.add_argument("--model", required=True, help="Fotonet v1.1 model ID or checkpoint path")
+    p_pred.add_argument("--model", required=True, help="fotonet v1.1 model ID or checkpoint path")
     p_pred.add_argument("--source", required=True, help="Image, directory, or video path")
     p_pred.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     p_pred.add_argument("--iou", type=float, default=0.50,
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 11. evaluate
     p_eval = subparsers.add_parser("evaluate", help="Full COCO benchmark evaluation (mAP, PR, Confusion)")
-    p_eval.add_argument("--model", required=True, help="Fotonet v1.1 model ID or checkpoint path")
+    p_eval.add_argument("--model", required=True, help="fotonet v1.1 model ID or checkpoint path")
     p_eval.add_argument("--data", required=True, help="Dataset YAML path")
     p_eval.add_argument("--conf", type=float, default=0.25,
                         help="Operating confidence threshold for precision/recall (mAP keeps every detection)")
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 12. export
     p_exp = subparsers.add_parser("export", help="Multi-target export with L1 < 1e-5 numerical parity check")
-    p_exp.add_argument("--model", required=True, help="Fotonet v1.1 model ID or checkpoint path")
+    p_exp.add_argument("--model", required=True, help="fotonet v1.1 model ID or checkpoint path")
     p_exp.add_argument("--format", default="onnx", help="Export target format (onnx, tensorrt, coreml, torchscript)")
     p_exp.add_argument("--precision", default="fp32", help="Precision (fp32, fp16, int8)")
     p_exp.add_argument("--verify", action="store_true", default=True, help="Verify numerical parity")

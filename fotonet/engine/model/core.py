@@ -35,6 +35,7 @@ class Fotonet(
         # Preserve the zero-argument device hook used by downstream callers;
         # only pass an argument when the caller explicitly chose a device.
         self.device = check_device() if device is None else check_device(device)
+        self._device_explicit = device is not None
         self.task = str(task).lower()
         if self.task != "detect":
             raise ValueError("fotonet supports task='detect' only.")

@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 import torch
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 try:
     import cv2
 except Exception:
@@ -95,13 +95,33 @@ class PreprocessMixin:
             if PreprocessMixin._is_url(source):
                 request = Request(source, headers={"User-Agent": "fotonet/0.2"})
                 with urlopen(request, timeout=20) as response:
-                    return Image.open(io.BytesIO(response.read())).convert("RGB")
+                    return PreprocessMixin._decode_pil(io.BytesIO(response.read()))
             if not os.path.isfile(source):
                 raise FileNotFoundError(f"Image source not found: {source}")
-            return Image.open(source).convert("RGB")
+            return PreprocessMixin._decode_pil(source)
         if isinstance(source, (Image.Image, np.ndarray)):
             return source
         raise TypeError("source must be an image path/URL, directory, PIL image, NumPy array, tensor, video path, or webcam index.")
+
+    @staticmethod
+    def _decode_pil(fp):
+        """Open an image file as RGB the way the training loader sees it.
+
+        cv2 and nvjpeg apply the EXIF orientation and shift 16-bit samples to
+        8 bits, so predict does the same; otherwise phone photos come out
+        rotated against their labels and 16-bit grayscale clips to white.
+        """
+        with Image.open(fp) as image:
+            image = ImageOps.exif_transpose(image)
+            return PreprocessMixin._pil_rgb(image)
+
+    @staticmethod
+    def _pil_rgb(image):
+        if image.mode.startswith("I;16") or image.mode == "I":
+            # Pillow's convert("RGB") clips these to 0..255 instead of scaling.
+            arr = np.asarray(image).astype(np.int64)
+            return Image.fromarray(np.clip(arr >> 8, 0, 255).astype(np.uint8)).convert("RGB")
+        return image.convert("RGB")
 
     @staticmethod
     def _orig_images_from_tensor(tensor, retain_images=True):
@@ -165,6 +185,8 @@ class PreprocessMixin:
             if arr.max() <= 1.0:
                 arr = arr * 255.0
             arr = np.rint(arr).astype(np.uint8)
+        elif arr.dtype == np.uint16:
+            arr = (arr >> 8).astype(np.uint8)
         elif arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         if bgr:
@@ -206,7 +228,7 @@ class PreprocessMixin:
         """Letterbox image to the training geometry and return scale metadata."""
         if not isinstance(img, Image.Image):
             return PreprocessMixin._preprocess_rgb_array(img, imgsz, device)
-        return PreprocessMixin._preprocess_rgb_array(np.asarray(img.convert("RGB")), imgsz, device)
+        return PreprocessMixin._preprocess_rgb_array(np.asarray(PreprocessMixin._pil_rgb(img)), imgsz, device)
 
     @staticmethod
     def _preprocess_numpy_rgb(img, imgsz, device=None):

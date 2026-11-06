@@ -1,5 +1,5 @@
 """
-FOTONET Loss Functions.
+fotonet loss functions.
 DualLoss: O2O + O2M assignment with Focal + DFL + CIoU.
 Uses Distribution Focal Loss (DFL) for regression instead of L1.
 """

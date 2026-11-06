@@ -11,6 +11,9 @@ from ..graph import FEATURE_STRIDES
 
 
 DEFAULTS = {
+    # Trainer profile: which part version fills each training slot (trainer/profiles.py). "1.1" is
+    # the trainer of the published v1.1 weights; "1.2" the v1.2 trainer. Same model either way.
+    "trainer": "1.1",
     "epochs": 120,
     "batch": 16,
     "nbs": 128,
@@ -28,6 +31,11 @@ DEFAULTS = {
     # "wsd" (warmup, stable, decay), "cosine", or "decay" (decay only; finish).
     "lr_scheduler": "wsd",
     "wsd_decay_fraction": 0.20,
+    # WSD decay length in epochs; 0 = use wsd_decay_fraction. 300 of 500 with warmup 5 gives
+    # 5 warmup + 195 stable + 300 decay.
+    "wsd_decay_epochs": 0,
+    # sched.lr@1.2 only: the decay's shape, "cosine" (v1), "linear" or "sqrt" (1 - sqrt).
+    "wsd_shape": "cosine",
     "grad_clip": 10.0,
     "close_mosaic": 15,
     "mmax": 160,
@@ -77,6 +85,15 @@ DEFAULTS = {
     # background, where p is near zero, stays almost free.
     "o2o_neg_alpha": 0.75,
     "o2o_neg_gamma": 2.0,
+    # loss.dual_o2o_o2m@1.2 only: the deployed head's class loss, "bce" (every negative at full
+    # strength, as YOLOv10/YOLO26), "mal" (DEIM) or "vfl" (v1), and the power on its IoU target.
+    "o2o_cls": "vfl",
+    "o2o_q_gamma": 1.0,
+    # assign.dual_o2o_o2m@1.2 only: the one-to-one rule's own center-prior fade, in epochs. -1 follows
+    # the O2M prior as v1 does (fix F8); 0 = no prior; N > 0 = fades out over the first N epochs.
+    "o2o_prior_epochs": -1,
+    # assign.dual_o2o_o2m@1.2 only: the O2M positives' target, "iou" (v1) or "tal" (task-aligned).
+    "o2m_target": "iou",
     # Multiplies the scheduled learning rate; a live-tunable knob that leaves the schedule's shape alone.
     "lr_scale": 1.0,
     # Read live_settings.yaml in the output folder at every epoch start (see trainer/live.py).
@@ -121,6 +138,15 @@ DEFAULTS = {
     # Profile this many training steps (after 10 warmup steps) into
     # <run>/profile.json; 0 disables the profiler.
     "profile_steps": 0,
+    # Guard rails every N epochs on the first probe_images validation images (probe.head_matrix):
+    # o2o, o2o + NMS and o2m + NMS AP, precision and recall at 0.25, duplicate rate. 0 = off.
+    "probe_period": 0,
+    "probe_images": 1000,
+    # A random val and train image through the current weights every N minutes, for Studio
+    # (probe.live_preview; <run>/preview/preview.json). 0 = off.
+    "preview_minutes": 5.0,
+    # The final-mAP forecast after each validation (probe.forecast; <run>/forecast.json).
+    "forecast": True,
     "nc": None,
 }
 
@@ -128,7 +154,7 @@ DEFAULTS = {
 _M_TIERS = (16, 32, 64, 96, 128, 160)
 
 
-_EXTRA_OPTIONS = ("augment_hyp", "callbacks", "knob_schedule")
+_EXTRA_OPTIONS = ("augment_hyp", "callbacks", "knob_schedule", "parts")
 
 
 _CALLBACK_EVENTS = ("on_train_start", "on_epoch_end", "on_val_end", "on_train_end")
@@ -204,6 +230,7 @@ def _recipe_overrides(recipe):
                     break
     out["augment_hyp"] = dict(settings.get("augment_hyp") or {})
     out["knob_schedule"] = list(settings.get("knob_schedule") or [])
+    out["parts"] = dict(settings.get("parts") or {})
     return out
 
 

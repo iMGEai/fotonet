@@ -70,22 +70,57 @@ def _final_val_epochs(setting, epochs, kind, decay_fraction):
 
 
 class _Schedule:
-    """Step-level schedule; rebuilt when a time budget changes the epoch count."""
+    """Step-level schedule; rebuilt when a time budget changes the epoch count.
 
-    def __init__(self, cfg, epochs, steps_per_epoch):
+    ``lr_fn`` is the run's ``sched.lr`` part: ``_lr_at`` (v1, the default) or ``_lr_at_v2``, which
+    also takes ``wsd_shape``. ``wsd_decay_epochs`` > 0 sets the decay length in epochs instead of
+    ``wsd_decay_fraction``.
+    """
+
+    def __init__(self, cfg, epochs, steps_per_epoch, lr_fn=None):
         self.epochs = int(epochs)
+        self.steps_per_epoch = int(steps_per_epoch)
         self.kind = str(cfg["lr_scheduler"]).lower()
         self.total_steps = self.epochs * steps_per_epoch
         warm = 0 if self.kind == "decay" else int(cfg["warmup_epochs"])
         self.warmup_steps = warm * steps_per_epoch
         fraction = min(max(float(cfg["wsd_decay_fraction"]), 0.01), 0.95)
-        self.decay_start = self.warmup_steps + int((self.total_steps - self.warmup_steps) * (1.0 - fraction))
+        decay_epochs = int(cfg.get("wsd_decay_epochs") or 0)
+        if decay_epochs > 0 and self.kind == "wsd":
+            decay_epochs = min(decay_epochs, max(self.epochs - warm, 1))
+            self.decay_start = (self.epochs - decay_epochs) * steps_per_epoch
+            fraction = decay_epochs / max(self.epochs, 1)
+        else:
+            self.decay_start = self.warmup_steps + int((self.total_steps - self.warmup_steps) * (1.0 - fraction))
         self.close_from = self.epochs - int(cfg["close_mosaic"]) + 1
         self.imgsz_for = _parse_schedule(cfg.get("imgsz_schedule"), self.epochs)
         self.val_final = _final_val_epochs(cfg.get("val_final_epochs"), self.epochs, self.kind, fraction)
+        self.lr_fn = lr_fn if lr_fn is not None else _lr_at
+        self.shape = str(cfg.get("wsd_shape") or "cosine").lower()
 
     def lr(self, gstep, lr0, lrf):
-        return _lr_at(gstep, self.warmup_steps, self.decay_start, self.total_steps, lr0, lrf, self.kind)
+        if self.lr_fn is _lr_at:
+            return _lr_at(gstep, self.warmup_steps, self.decay_start, self.total_steps, lr0, lrf, self.kind)
+        return self.lr_fn(gstep, self.warmup_steps, self.decay_start, self.total_steps, lr0, lrf, self.kind, self.shape)
+
+    def decay_epoch(self):
+        """The first epoch of the decay (1-based), or None for schedules without one."""
+        if self.kind == "decay":
+            return 1
+        if self.kind != "wsd":
+            return None
+        return int(self.decay_start // max(self.steps_per_epoch, 1)) + 1
+
+    def plan(self, lr0, lrf, side, mosaic, samples=16):
+        """Per-epoch plan: mean learning rate, image size and mosaic probability (forecast, run_info)."""
+        lrs, sizes, mos = [], [], []
+        spe = max(self.steps_per_epoch, 1)
+        for e in range(self.epochs):
+            start = e * spe
+            lrs.append(sum(self.lr(start + int((i + 0.5) * spe / samples), lr0, lrf) for i in range(samples)) / samples)
+            sizes.append(int(self.imgsz_for(e + 1)) if self.imgsz_for else int(side))
+            mos.append(0.0 if e + 1 >= self.close_from else float(mosaic))
+        return lrs, sizes, mos
 
     def phase(self, epoch, gstep, warmup_epochs):
         if self.kind == "decay":

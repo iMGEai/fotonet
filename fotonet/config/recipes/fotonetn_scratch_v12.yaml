@@ -1,0 +1,118 @@
+# FOTONET v1.2 scratch recipe: fotonetn, trained with the v1.2 trainer (docs/internal/v1_2_trainer_plan.md).
+# Same model as fotonetn_scratch (layout, parameters and fingerprint unchanged); only training differs.
+#
+# What changes against fotonetn_scratch (the recipe of the published v1.1 weights):
+#   - trainer 1.2: loss.dual_o2o_o2m@2, assign.dual_o2o_o2m@2, sched.lr@2, aug.mosaic@2.
+#   - The deployed head's class loss is BCE with every negative at full strength from epoch 1
+#     (o2o_cls: bce). Under varifocal, r2 kept ~62% duplicate boxes for 200 epochs.
+#   - The one-to-one matching rule fades its center prior on its own (o2o_prior_epochs 6), apart from
+#     the class-target ramp (epochs 3-10), so the two no longer finish together (finding 2).
+#   - Full-canvas mosaic: a zoom-out shows more of the four images instead of gray borders.
+#   - Schedule: 5 warmup epochs, 195 stable, 300 decay (cosine), 500 in all.
+#   - 640 px from epoch 81: lower resolution only for the first 40% of the warmup + stable part.
+#   - Mosaic off for the last 25 epochs (was 15).
+#   - Validation every 5 epochs, every epoch over the last 50; guard-rail probes every 5 epochs;
+#     a live preview pair every 5 minutes; the final-mAP forecast after each validation.
+
+model: fotonetn
+pretrained: false
+resume: false
+trainer: "1.2"
+
+train:
+  epochs: 500
+  imgsz: 640
+  # 512 px for epochs 1-40, 576 px for 41-80, 640 px from 81 on.
+  imgsz_schedule:
+    - [0.08, 512]
+    - [0.08, 576]
+    - [0.84, 640]
+  nbs: 128
+  batch: 16
+  workers: 4
+  predecode: false
+  predecode_dir: null
+  predecode_max_side: 720
+  close_mosaic: 25
+  out_dir: runs/train
+  lr_scheduler: wsd
+  # 5 warmup + 195 stable + 300 decay epochs.
+  wsd_decay_epochs: 300
+  wsd_shape: cosine
+  wsd_decay_fraction: 0.60
+  grad_clip: 10.0
+  val_period: 5
+  val_final_epochs: 50
+  val_batch: 8
+  val_workers: 2
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 5.0
+  forecast: true
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 5
+  ema_decay: 0.99985
+  ema_tau: 2000
+
+augment:
+  mosaic: 0.90
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.562
+  fliplr: 0.606
+  flipud: 0.0
+  degrees: 1.11
+  shear: 1.46
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.106
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  # Class targets go from 1.0 to the matched IoU over epochs 3-10.
+  quality_start_epoch: 3
+  quality_warmup_epochs: 8
+  # The O2M matching's center prior fades over epochs 1-6, and so does the one-to-one rule's own.
+  center_prior_epochs: 6
+  o2o_prior_epochs: 6
+  # The deployed head: BCE, IoU target, runner-up anchors pushed 1.5x. o2o_neg_alpha and
+  # o2o_neg_gamma only apply to o2o_cls: vfl.
+  o2o_cls: bce
+  o2o_q_gamma: 1.0
+  w_runner_up: 1.5
+  o2o_neg_alpha: 1.0
+  o2o_neg_gamma: 1.0
+
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  o2o_metric: consistent
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+  # The O2M positives' target: iou (as v1.1) or tal (task-aligned, an optional arm).
+  o2m_target: iou
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

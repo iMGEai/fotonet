@@ -1,4 +1,4 @@
-"""``Fotonet`` cOCO-style validation."""
+"""``Fotonet`` COCO-style validation."""
 import torch
 from fotonet.utils.config import (
     class_names_are_default,

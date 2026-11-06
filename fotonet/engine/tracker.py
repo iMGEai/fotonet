@@ -1,4 +1,4 @@
-"""Small dependency-free tracker used by :meth:`FOTONET.track`.
+"""Small dependency-free tracker used by :meth:`Fotonet.track`.
 
 [SIMPLIFIED] This is an IoU/class association tracker, not a motion-model
 tracker. It provides stable IDs for ordered image/video frames without

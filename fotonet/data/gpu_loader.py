@@ -60,14 +60,15 @@ def _resized_shape(height, width, size):
 class Part:
     """One source image pasted into a canvas: where it comes from and where it goes."""
 
-    __slots__ = ("kind", "payload", "resized", "src", "dst")
+    __slots__ = ("kind", "payload", "resized", "src", "dst", "smooth")
 
-    def __init__(self, kind, payload, resized, src, dst):
+    def __init__(self, kind, payload, resized, src, dst, smooth=False):
         self.kind = kind          # "jpeg": encoded bytes; "raw": decoded HWC uint8 RGB
         self.payload = payload
         self.resized = resized    # (h, w) after the longest-side resize
         self.src = src            # (y1, y2, x1, x2) in the resized image
         self.dst = dst            # (y1, y2, x1, x2) in the canvas
+        self.smooth = smooth      # antialias a GPU downscale (aug.mosaic@1.2 zoom-outs)
 
 
 class GeometryMixin:
@@ -81,6 +82,9 @@ class GeometryMixin:
     # one JPEG decode instead of four.
     mosaic_buffer = 0
     MOSAIC_BUFFER_WARM = 16
+    # aug.mosaic version: 1 crops the canvas to its center before the GPU zoom; 2 zooms the whole
+    # canvas in the worker (mosaic_geometry_v2).
+    mosaic_version = 1
 
     def _header(self, idx):
         cache = self.__dict__.setdefault("_header_cache", {})
@@ -164,6 +168,35 @@ class GeometryMixin:
         return [part], boxes, labels
 
     def _mosaic_geometry_once(self, idx, size):
+        if int(getattr(self, "mosaic_version", 1) or 1) >= 2:
+            return mosaic_geometry_v2(self, idx, size)
+        return mosaic_geometry_v1(self, idx, size)
+
+    def _part_v2(self, idx, is_jpeg, base, scaled, src, dst, cached=None, remember=False):
+        """A mosaic v2 part: the image resized straight to its zoomed size, then cropped."""
+        import cv2
+
+        hs, ws = scaled
+        if cached is not None:
+            payload = cached
+        else:
+            kind, payload = self._payload(idx, is_jpeg)
+            if kind == "jpeg":
+                return Part(kind, payload, scaled, src, dst, smooth=True)
+            if remember and self._mosaic_pool() is not None:
+                # The partner buffer keeps images at the base size; each later use zooms its own way.
+                h, w = base
+                if payload.shape[:2] != (h, w):
+                    payload = cv2.resize(payload, (w, h), interpolation=cv2.INTER_LINEAR)
+                self._remember(idx, base, payload)
+        if payload.shape[:2] != (hs, ws):
+            shrink = hs < payload.shape[0] or ws < payload.shape[1]
+            payload = cv2.resize(payload, (ws, hs), interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
+        y1, y2, x1, x2 = src
+        crop = np.ascontiguousarray(payload[y1:y2, x1:x2])
+        return Part("raw", torch.from_numpy(crop), crop.shape[:2], (0, y2 - y1, 0, x2 - x1), dst)
+
+    def _mosaic_geometry_v1_once(self, idx, size):
         pool = self._mosaic_pool()
         cached = [None] * 4
         candidates = None
@@ -245,7 +278,8 @@ class GeometryMixin:
             if best is None:
                 best = (specs, boxes, labels)
         specs, boxes, labels = best
-        return [self._part(*spec) for spec in specs], boxes, labels
+        # v2 specs carry the zoomed size as well (8 fields).
+        return [self._part_v2(*spec) if len(spec) == 8 else self._part(*spec) for spec in specs], boxes, labels
 
     def geometry_sample(self, idx):
         size = int(self.imgsz)
@@ -254,11 +288,124 @@ class GeometryMixin:
             parts, boxes, labels = self._mosaic_geometry(idx, size)
         else:
             parts, boxes, labels = self._letterbox_geometry(idx, size)
-        return {
+        sample = {
             "parts": parts,
             "boxes": torch.from_numpy(np.asarray(boxes, dtype=np.float32).reshape(-1, 4)),
             "labels": torch.from_numpy(np.asarray(labels, dtype=np.int64).reshape(-1)),
         }
+        if use_mosaic and int(getattr(self, "mosaic_version", 1) or 1) >= 2:
+            # The worker already zoomed and shifted this mosaic; the GPU affine skips both.
+            sample["pre_zoom"] = True
+        return sample
+
+
+def _mosaic_rect(slot, center_x, center_y, w, h, large):
+    """Where quadrant ``slot`` of a mosaic lands on the 2x canvas, and the matching corner of the image."""
+    if slot == 0:
+        x1a, y1a, x2a, y2a = max(center_x - w, 0), max(center_y - h, 0), center_x, center_y
+        x1b, y1b = w - (x2a - x1a), h - (y2a - y1a)
+    elif slot == 1:
+        x1a, y1a, x2a, y2a = center_x, max(center_y - h, 0), min(center_x + w, large), center_y
+        x1b, y1b = 0, h - (y2a - y1a)
+    elif slot == 2:
+        x1a, y1a, x2a, y2a = max(center_x - w, 0), center_y, center_x, min(large, center_y + h)
+        x1b, y1b = w - (x2a - x1a), 0
+    else:
+        x1a, y1a, x2a, y2a = center_x, center_y, min(center_x + w, large), min(large, center_y + h)
+        x1b, y1b = 0, 0
+    return x1a, y1a, x2a, y2a, x1b, y1b
+
+
+def _mosaic_partners(dataset, idx):
+    """The four images of a mosaic (the fresh one first) and any partner pixels from the worker buffer."""
+    pool = dataset._mosaic_pool()
+    cached = [None] * 4
+    candidates = None
+    if pool is not None and len(pool) >= min(dataset.MOSAIC_BUFFER_WARM, int(dataset.mosaic_buffer)):
+        candidates = list({entry[0]: entry for entry in pool if entry[0] != int(idx)}.values())
+    if candidates is not None and len(candidates) >= 3:
+        picks = random.sample(candidates, 3)
+        indices = [idx] + [entry[0] for entry in picks]
+        cached[1:] = [entry[2] for entry in picks]
+    else:
+        indices = [idx] + [int(dataset.sample_index()) for _ in range(3)]
+    return indices, cached
+
+
+def mosaic_geometry_v1(dataset, idx, size):
+    """``aug.mosaic@1.0.0``: the 2x canvas cropped to its central window; the GPU affine zooms after."""
+    return dataset._mosaic_geometry_v1_once(idx, size)
+
+
+def mosaic_geometry_v2(dataset, idx, size):
+    """``aug.mosaic@1.2``: the mosaic's zoom and shift applied to the whole 2x canvas.
+
+    v1 keeps only the canvas's central window and leaves the zoom to the GPU affine, so a zoom-out
+    shows gray borders (26% of v1 mosaic pixels are padding, against 12% for a standard mosaic, and
+    the standard one shows 1.47x as much image per sample). Here the worker draws the zoom ``k`` and
+    shift ``t`` from the ranges the GPU affine uses (``scale``, ``translate``), maps the output window
+    back onto the canvas (side ``size / k``) and pastes each visible part already zoomed. A zoom-out
+    then shows more of the four images, as YOLOv5/v8, YOLOX and RTMDet do. The sample is marked
+    ``pre_zoom`` and the GPU affine keeps only its rotation, shear, flips and colour.
+
+    Canvas point ``p`` lands at output ``k * (p - size) + size / 2 + t``. Returns v1's
+    ``(specs, boxes, labels, source_count)``; specs have the zoomed size as an extra field.
+    """
+    hyp = dataset.augment_hyp
+    scl = float(hyp.get("scale", 0.0))
+    trn = float(hyp.get("translate", 0.0))
+    k = random.uniform(max(1.0 - scl, 0.05), 1.0 + scl)
+    tx = random.uniform(-trn, trn) * size
+    ty = random.uniform(-trn, trn) * size
+    indices, cached = _mosaic_partners(dataset, idx)
+    center_x = int(random.uniform(size * 0.5, size * 1.5))
+    center_y = int(random.uniform(size * 0.5, size * 1.5))
+    large = size * 2
+    specs, all_boxes, all_labels, all_areas = [], [], [], []
+    source_count = 0
+    for slot, j in enumerate(indices):
+        h0, w0, is_jpeg = dataset._header(j)
+        h, w = _resized_shape(h0, w0, size)
+        x1a, y1a, x2a, y2a, x1b, y1b = _mosaic_rect(slot, center_x, center_y, w, h, large)
+        boxes, labels = dataset._labels(j)
+        source_count += len(labels)
+        if x2a <= x1a or y2a <= y1a:
+            continue
+        hs, ws = max(int(round(h * k)), 1), max(int(round(w * k)), 1)
+        fx, fy = ws / w, hs / h
+        # The zoomed image's origin in output pixels, rounded once so pixels and boxes share it.
+        ox = int(round(k * (x1a - x1b - size) + size * 0.5 + tx))
+        oy = int(round(k * (y1a - y1b - size) + size * 0.5 + ty))
+        ax1, ax2 = ox + int(round(x1b * fx)), ox + int(round((x1b + x2a - x1a) * fx))
+        ay1, ay2 = oy + int(round(y1b * fy)), oy + int(round((y1b + y2a - y1a) * fy))
+        dx1, dx2, dy1, dy2 = max(ax1, 0), min(ax2, size), max(ay1, 0), min(ay2, size)
+        if dx2 > dx1 and dy2 > dy1:
+            src = (dy1 - oy, dy2 - oy, dx1 - ox, dx2 - ox)
+            specs.append((j, is_jpeg, (h, w), (hs, ws), src, (dy1, dy2, dx1, dx2), cached[slot], cached[slot] is None))
+        if len(boxes):
+            xyxy = xywhn_to_xyxy(boxes, w, h)
+            area = np.maximum(xyxy[:, 2] - xyxy[:, 0], 0.0) * np.maximum(xyxy[:, 3] - xyxy[:, 1], 0.0) * fx * fy
+            # Only this part of the image is on the canvas.
+            xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], x1b, x1b + (x2a - x1a)) * fx + ox
+            xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], y1b, y1b + (y2a - y1a)) * fy + oy
+            all_boxes.append(xyxy)
+            all_labels.append(labels)
+            all_areas.append(area)
+    if not all_boxes:
+        return specs, np.zeros((0, 4), np.float32), np.zeros((0,), np.int64), source_count
+    boxes = np.concatenate(all_boxes, 0)
+    labels = np.concatenate(all_labels, 0)
+    area = np.concatenate(all_areas, 0)
+    boxes = clip_boxes_xyxy(boxes, size, size)
+    bw, bh = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+    visible = (bw * bh) / np.maximum(area, 1e-6)
+    keep = (bw > 2.0) & (bh > 2.0) & (visible > 0.1) & np.isfinite(boxes).all(axis=1)
+    boxes, labels = boxes[keep], labels[keep]
+    if len(boxes):
+        boxes, labels = sanitize_boxes_xywhn(xyxy_to_xywhn(boxes, size, size), labels)
+    else:
+        boxes, labels = np.zeros((0, 4), np.float32), np.zeros((0,), np.int64)
+    return specs, boxes, labels, source_count
 
 
 def collate_geometry(batch):
@@ -380,13 +527,18 @@ class GpuMosaicAssembler:
                     image = next(raw)
                 h, w = part.resized
                 if tuple(image.shape[-2:]) != (h, w):
+                    smooth = bool(getattr(part, "smooth", False)) and (h < image.shape[-2] or w < image.shape[-1])
                     image = F.interpolate(
                         image.unsqueeze(0).float(), size=(h, w), mode="bilinear", align_corners=False,
+                        antialias=smooth,
                     ).squeeze(0).round_().clamp_(0, 255).to(torch.uint8)
                 y1b, y2b, x1b, x2b = part.src
                 y1, y2, x1, x2 = part.dst
                 canvas[b, :, y1:y2, x1:x2] = image[:, y1b:y2b, x1b:x2b]
-        targets = [{"boxes": sample["boxes"], "labels": sample["labels"]} for sample in samples]
+        targets = [
+            {"boxes": sample["boxes"], "labels": sample["labels"], **({"pre_zoom": True} if sample.get("pre_zoom") else {})}
+            for sample in samples
+        ]
         return canvas, targets
 
 

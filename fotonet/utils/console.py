@@ -521,7 +521,7 @@ def print_train_card(
     target_width = min(term_width - 1, max(needed_for_pair, needed_sched if can_dual_sched else 78, 80))
 
     # Title with ZERO emojis
-    title = " FOTONET Training Engine "
+    title = " fotonet Training Engine "
     title_styled = Ansi.paint(title, Ansi.BOLD, Ansi.CYAN)
     title_len = visible_len(title)
 
@@ -556,11 +556,14 @@ def print_train_card(
         print(make_single_row(sched_label, target_width))
         print(make_single_row(policy_label, target_width))
 
+    # A long path would push the row past the box's right edge; keep its end.
+    room = max(target_width - 14, 12)
+    fit = lambda text: text if len(text) <= room else "…" + text[-(room - 1):]
     if resume_path:
-        resume_str = f"Resumed:  {Ansi.paint(str(resume_path), Ansi.AMBER)}"
+        resume_str = f"Resumed:  {Ansi.paint(fit(str(resume_path)), Ansi.AMBER)}"
         print(make_single_row(resume_str, target_width))
     if recipe_name:
-        recipe_str = f"Recipe:   {Ansi.paint(str(recipe_name), Ansi.GRAY)}"
+        recipe_str = f"Recipe:   {Ansi.paint(fit(str(recipe_name)), Ansi.GRAY)}"
         print(make_single_row(recipe_str, target_width))
 
     print(bot_line)
@@ -669,13 +672,19 @@ def print_completion_card(result: Dict[str, Any]):
     score_str = f"{best_score:.4f}" if best_score is not None else "n/a"
 
     row2_left = f"Best Score: {Ansi.paint(score_str, Ansi.GREEN, Ansi.BOLD)} ({best_metric})"
-    row2_right = f"Run:    {Ansi.paint(str(result.get('training_run_id', ''))[:12], Ansi.GRAY)}"
+    # A run id can be a folder path, whose first 12 characters were just "C:" and part of a user folder.
+    run_id = str(result.get("training_run_id", "")).rstrip("/\\")
+    run_id = os.path.basename(run_id) or run_id
+    row2_right = f"Run:    {Ansi.paint(run_id[:12], Ansi.GRAY)}"
 
+    # Keep a long checkpoint path's end inside the box.
+    room = max(target_width - 21, 12)
+    fit = lambda text: text if len(text) <= room else "…" + text[-(room - 1):]
     best_ckpt = result.get("best_checkpoint")
-    row3 = f"Best Checkpoint: {Ansi.paint(str(best_ckpt), Ansi.CYAN)}" if best_ckpt else ""
+    row3 = f"Best Checkpoint: {Ansi.paint(fit(str(best_ckpt)), Ansi.CYAN)}" if best_ckpt else ""
 
     last_ckpt = result.get("last_checkpoint")
-    row4 = f"Last Checkpoint: {Ansi.paint(str(last_ckpt), Ansi.GRAY)}" if last_ckpt else ""
+    row4 = f"Last Checkpoint: {Ansi.paint(fit(str(last_ckpt)), Ansi.GRAY)}" if last_ckpt else ""
 
     bot_line = f"{Ansi.paint(GLYPHS['box_bl'] + h_bar + GLYPHS['box_br'], Ansi.DARK_GRAY)}"
 

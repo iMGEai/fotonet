@@ -1,6 +1,6 @@
 """Shared public/trainer validation path.
 
-Keeping this outside either facade prevents ``FOTONET.val()`` from quietly
+Keeping this outside either facade prevents ``Fotonet.val()`` from quietly
 using a different data/metric protocol than epoch validation.
 """
 from __future__ import annotations

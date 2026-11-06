@@ -654,7 +654,7 @@ def cmd_convert_dataset(args: argparse.Namespace) -> None:
                 ann_id += 1
         categories_list = [{"id": cid, "name": name} for cid, name in sorted(coco_categories.items())]
         coco_doc = {
-            "info": {"description": "Fotonet Studio Dataset Export"},
+            "info": {"description": "fotonet Studio Dataset Export"},
             "images": coco_images,
             "annotations": coco_annotations,
             "categories": categories_list,

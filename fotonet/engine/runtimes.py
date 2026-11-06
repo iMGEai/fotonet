@@ -93,7 +93,7 @@ class TorchScriptRuntime(nn.Module):
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(
                     "TorchScript artifact contains invalid embedded FOTO-NET metadata. "
-                    "Re-export it with FOTONET.export(..., format='torchscript')."
+                    "Re-export it with Fotonet.export(..., format='torchscript')."
                 ) from exc
             if str(metadata.get("graph_version", "")).startswith("1.1"):
                 from fotonet.versions.v1_1.api import validate_v11_metadata

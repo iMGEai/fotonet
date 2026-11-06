@@ -119,6 +119,9 @@ def main(argv=None):
     from fotonet.versions import is_v11_model
 
     constructor = {}
+    if "device" in args:
+        # The model is built on it; val() and info() take no device of their own.
+        constructor["device"] = args.pop("device")
     if is_v11_model(model_name) and "pretrained" in args:
         # For a v1.1 id this chooses published weights vs. an untrained build.
         constructor["pretrained"] = bool(args.pop("pretrained"))
@@ -143,6 +146,8 @@ def main(argv=None):
         recipe = args.pop("recipe", None)
         if explicit_imgsz:
             args["imgsz"] = imgsz
+        if args.pop("dry_run", False):
+            return _v11_dry_run(model_name, data, recipe, args)
         print(f"fotonet train | model={model_name} data={data}" + (f" recipe={recipe}" if recipe else ""))
         if recipe is None:
             result = model.train(data=data, **args)
@@ -159,6 +164,12 @@ def main(argv=None):
         if not data:
             raise SystemExit("Training requires data=path/to/data.yaml.")
         recipe = args.pop("recipe", None)
+        if args.pop("dry_run", False):
+            print(f"fotonet train (dry run) | model={model_name} data={data} recipe={recipe} imgsz={imgsz}")
+            _dry_run_data(data)
+            for key, value in sorted(args.items()):
+                print(f"  {key}={value!r}")
+            return
         epochs = int(args.pop("epochs", 100)) if recipe is None else None
         save_path = args.pop("save", "fotonet_trained.pt")
         if recipe is None:
@@ -180,7 +191,10 @@ def main(argv=None):
         source = args.pop("source", None)
         if source is None or source == "":
             raise SystemExit(f"{task} requires source=image.jpg|folder|video|webcam-index.")
-        conf = float(args.pop("conf", 0.25))
+        try:
+            conf = float(args.pop("conf", 0.25))
+        except ValueError:
+            raise SystemExit("conf must be a number in [0, 1], e.g. conf=0.25.") from None
         save = _pop_bool(args, "save", True)
         show = _pop_bool(args, "show", False)
         if isinstance(args.get("classes"), str):
@@ -239,6 +253,36 @@ def main(argv=None):
         out = model.export(path=path, format=fmt, imgsz=imgsz, **args)
         print(f"exported={out['artifact']}")
         print(f"metadata={out['metadata']}")
+
+
+def _dry_run_data(data):
+    """Load the data config and count each split's images, so a bad path fails now."""
+    from fotonet.data.dataset import expand_image_sources
+    from fotonet.data.starter import resolve_data
+    from fotonet.utils.config import load_data_cfg
+
+    cfg = load_data_cfg(resolve_data(data))
+    for split in ("train", "val"):
+        if cfg.get(split):
+            print(f"  {split}: {len(expand_image_sources(cfg[split]))} images")
+    print(f"  nc: {cfg.get('nc')}")
+    return cfg
+
+
+def _v11_dry_run(model_name, data, recipe, options):
+    """Everything a v1.1 train checks before it loads data, then the settings it would use."""
+    from fotonet.versions.v1_1.trainer.options import DEFAULTS, _check_options, _recipe_overrides
+
+    _check_options(options)
+    settings = dict(DEFAULTS)
+    settings.update({k: v for k, v in _recipe_overrides(recipe).items() if k not in ("augment_hyp", "knob_schedule")})
+    settings.update({k: v for k, v in options.items() if k in DEFAULTS and v is not None})
+    print(f"fotonet train (dry run) | model={model_name} data={data}" + (f" recipe={recipe}" if recipe else ""))
+    _dry_run_data(data)
+    for key in sorted(settings):
+        mark = "*" if key in options else " "
+        print(f" {mark}{key}={settings[key]!r}")
+    print("(* set on this command line; nothing was trained)")
 
 
 def _model_free_task(task, args):
@@ -303,5 +347,20 @@ def _model_free_task(task, args):
         return
 
 
+def run():
+    """The console script: a bad argument prints one line, not a traceback.
+
+    ``FOTONET_DEBUG=1`` shows the traceback.
+    """
+    import os
+
+    try:
+        main()
+    except (ValueError, TypeError, FileNotFoundError, KeyError) as exc:
+        if os.environ.get("FOTONET_DEBUG"):
+            raise
+        raise SystemExit(f"fotonet: {type(exc).__name__}: {exc}") from None
+
+
 if __name__ == "__main__":
-    main()
+    run()

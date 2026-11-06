@@ -52,7 +52,7 @@ Documentation = "https://fotonet.studio/docs"
 Source = "https://github.com/iMGEai/fotonet"
 
 [project.scripts]
-fotonet = "fotonet.cli.main:main"
+fotonet = "fotonet.cli.main:run"
 
 [tool.setuptools.packages.find]
 where = ["."]

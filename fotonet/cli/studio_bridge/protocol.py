@@ -45,7 +45,7 @@ def emit_error(message: str, traceback_str: Optional[str] = None) -> None:
 
 
 def validate_v11_model_id(model_ref: str) -> str:
-    """Ensure that the model reference strictly belongs to Fotonet v1.1."""
+    """Ensure that the model reference strictly belongs to fotonet v1.1."""
     ref_lower = str(model_ref).strip().lower()
     if ref_lower in V11_MODEL_IDS:
         return ref_lower
@@ -57,15 +57,15 @@ def validate_v11_model_id(model_ref: str) -> str:
             return model_ref
     if "fotonete" in ref_lower:
         raise ValueError(
-            "fotonete is a legacy architecture and is not supported in Fotonet Studio. "
-            f"Fotonet Studio exclusively supports the Fotonet v1.1 family: {list(V11_MODEL_IDS)}."
+            "fotonete is a legacy architecture and is not supported in fotonet Studio. "
+            f"fotonet Studio exclusively supports the fotonet v1.1 family: {list(V11_MODEL_IDS)}."
         )
     if any(k in ref_lower for k in ("yolo", "rtdetr", "detectron")):
         raise ValueError(
             f"External model '{model_ref}' is not permitted. "
-            f"Fotonet Studio exclusively supports the native Fotonet v1.1 family: {list(V11_MODEL_IDS)}."
+            f"fotonet Studio exclusively supports the native fotonet v1.1 family: {list(V11_MODEL_IDS)}."
         )
     raise ValueError(
         f"Unknown or unsupported model '{model_ref}'. "
-        f"Expected one of {list(V11_MODEL_IDS)} or a valid Fotonet v1.1 checkpoint (.pt)."
+        f"Expected one of {list(V11_MODEL_IDS)} or a valid fotonet v1.1 checkpoint (.pt)."
     )

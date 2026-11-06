@@ -11,7 +11,7 @@ from .protocol import emit_result, V11_MODEL_IDS
 
 
 def cmd_env(args: argparse.Namespace) -> None:
-    """Query system hardware, GPU, PyTorch, CUDA, and supported Fotonet v1.1 models."""
+    """Query system hardware, GPU, PyTorch, CUDA, and supported fotonet v1.1 models."""
     import torch
 
     gpu_available = torch.cuda.is_available()

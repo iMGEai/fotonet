@@ -1,5 +1,5 @@
 """
-FOTONET matchers -- GPU score construction with compact CPU conflict
+fotonet matchers -- GPU score construction with compact CPU conflict
 resolution only when a one-to-one collision requires it.
 
 TaskAlignedAssigner (O2M):

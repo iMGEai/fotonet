@@ -35,14 +35,16 @@ class LoadingMixin:
 
                 weights = resolve_v11_release(key)
             if weights is not None:
+                requested_nc = self.nc  # loading sets self.nc to the checkpoint's count
                 self._load_v11_checkpoint(str(weights), self._safe_torch_load(str(weights)))
-                if int(self.model.nc) != int(self.nc):
+                if int(self.model.nc) != int(requested_nc):
                     # Explicit class count: keep the pretrained backbone, fresh class predictors.
                     from fotonet.versions.v1_1.engine import transfer_weights
 
-                    target = V11Detector(key, nc=self.nc, imgsz=spec.imgsz).to(self.device)
+                    target = V11Detector(key, nc=requested_nc, imgsz=spec.imgsz).to(self.device)
                     transfer_weights(self.model, target)
                     self.model = target.eval()
+                    self.nc = requested_nc
                     self._finish_v11_identity()
                 return True
             if getattr(self, "_pretrained", True):
@@ -128,11 +130,25 @@ class LoadingMixin:
         self.model_path = getattr(self, "model_path", None)
         self._infer_cache = None
 
+    def _onnx_device(self):
+        """The device for an ONNX session: CPU when onnxruntime has no CUDA provider
+        and the caller did not ask for a device (the plain ``pip install
+        onnxruntime`` next to a CUDA PyTorch)."""
+        if torch.device(self.device).type != "cuda" or getattr(self, "_device_explicit", True):
+            return self.device
+        try:
+            import onnxruntime
+        except ImportError:
+            return self.device
+        if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+            self.device = "cpu"
+        return self.device
+
     def _load_v11_runtime(self, model_path, metadata):
         suffix = Path(model_path).suffix.lower()
         if suffix == ".onnx":
             from fotonet.engine.runtimes import ONNXRuntime
-            runtime = ONNXRuntime(model_path, int(metadata["nc"]), self.device, strides=metadata["strides"])
+            runtime = ONNXRuntime(model_path, int(metadata["nc"]), self._onnx_device(), strides=metadata["strides"])
             self.runtime_format = "onnx"
         else:
             from fotonet.engine.runtimes import TorchScriptRuntime
@@ -179,7 +195,7 @@ class LoadingMixin:
             runtime = ONNXRuntime(
                 model_path,
                 metadata.get("nc", self.nc),
-                self.device,
+                self._onnx_device(),
                 strides=metadata.get("strides"),
             )
             # ONNX preserves its output width, so class count and input shape
@@ -424,9 +440,9 @@ class LoadingMixin:
         try:
             return torch.load(path, map_location="cpu", weights_only=True)
         except Exception as exc:
-            raise ValueError(
-                f"Could not safely load {path!r}; supported checkpoints must be tensor-only."
-            ) from exc
+            from fotonet.versions.v1_1.api import checkpoint_load_error
+
+            raise checkpoint_load_error(path, exc) from exc
 
     @staticmethod
     def _checkpoint_state_dict(checkpoint):

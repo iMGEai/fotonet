@@ -228,6 +228,7 @@ def _clamp_yolo_boxes(boxes: List[List[float]]) -> List[List[float]]:
 def cmd_augment_preview(args: argparse.Namespace) -> None:
     """Run an Albumentations augmentation pipeline on a single image and return base64 and boxes."""
     import cv2
+    import numpy as np
     import albumentations as A
 
     image_path = Path(args.image).resolve()
@@ -268,7 +269,7 @@ def cmd_augment_preview(args: argparse.Namespace) -> None:
     effects_list = pipeline_raw.get("effects", pipeline_raw) if isinstance(pipeline_raw, dict) else pipeline_raw
 
     # Read image
-    img = cv2.imread(str(image_path))
+    img = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"Could not read image: {image_path}")
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -321,6 +322,7 @@ def cmd_augment_preview(args: argparse.Namespace) -> None:
 def cmd_augment_batch(args: argparse.Namespace) -> None:
     """Batch dataset synthesis producing augmented images and YOLO .txt labels."""
     import cv2
+    import numpy as np
     import albumentations as A
 
     dataset_path = Path(args.dataset).resolve()
@@ -353,7 +355,7 @@ def cmd_augment_batch(args: argparse.Namespace) -> None:
     generated_count = 0
 
     for idx, img_p in enumerate(all_images):
-        img = cv2.imread(str(img_p))
+        img = cv2.imdecode(np.fromfile(str(img_p), dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             continue
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)

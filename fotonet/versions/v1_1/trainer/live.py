@@ -27,7 +27,7 @@ from .options import DEFAULTS
 LIVE_KEYS = frozenset({
     # loss
     "w_box", "w_o2o", "w_cons", "w_obj", "w_runner_up", "w_group", "o2o_neg_alpha", "o2o_neg_gamma",
-    "iou_type",
+    "iou_type", "o2o_cls", "o2o_q_gamma", "o2o_prior_epochs", "o2m_target",
     # assignment
     "alpha", "beta", "topk", "o2o_topk", "o2o_beta", "o2o_center_prior", "radius", "slack_cells",
     "o2o_metric", "matcher_candidates",
@@ -36,18 +36,24 @@ LIVE_KEYS = frozenset({
     "o2m_every_n_steps", "o2m_start_epoch", "o2m_disable_epoch", "o2o_detach",
     # optimizer, learning-rate schedule and EMA
     "lr_scale", "lr0", "lrf", "weight_decay", "momentum", "grad_clip", "warmup_epochs",
-    "wsd_decay_fraction", "lr_scheduler", "ema_decay", "ema_tau",
+    "wsd_decay_fraction", "lr_scheduler", "ema_decay", "ema_tau", "wsd_decay_epochs", "wsd_shape",
     # data
     "imgsz_schedule", "close_mosaic", "workers",
     # validation and stopping
     "val_period", "patience", "fast_val", "val_amp",
+    # probes, previews and the forecast (no effect on the training maths)
+    "probe_period", "probe_images", "preview_minutes", "forecast",
 })
 # Settings that rebuild the learning-rate and data schedule when they change.
-SCHEDULE_KEYS = frozenset({"warmup_epochs", "wsd_decay_fraction", "lr_scheduler", "imgsz_schedule", "close_mosaic"})
+SCHEDULE_KEYS = frozenset({"warmup_epochs", "wsd_decay_fraction", "lr_scheduler", "imgsz_schedule", "close_mosaic",
+                           "wsd_decay_epochs", "wsd_shape"})
 CHOICES = {
     "o2o_metric": {"consistent", "self"},
     "iou_type": {"siou", "ciou"},
     "lr_scheduler": {"wsd", "cosine", "decay"},
+    "o2o_cls": {"bce", "mal", "vfl"},
+    "o2m_target": {"iou", "tal"},
+    "wsd_shape": {"cosine", "linear", "sqrt"},
 }
 
 

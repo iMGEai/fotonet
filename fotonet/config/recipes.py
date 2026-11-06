@@ -29,7 +29,7 @@ def load_training_recipe(recipe):
     # Reserved top-level keys; everything else becomes a <name>_hyp section so a
     # recipe can add a knob group (o2m, cot, ...) without a loader change.
     reserved = {"train", "optimizer", "augment", "loss", "matcher", "model",
-                "pretrained", "resume", "smoke_limits", "knob_schedule"}
+                "pretrained", "resume", "smoke_limits", "knob_schedule", "trainer", "parts"}
     settings = {
         **train,
         "optimizer": optimizer.pop("name", train.get("optimizer", "sgd")),
@@ -41,6 +41,10 @@ def load_training_recipe(recipe):
         "matcher_hyp": dict(raw.get("matcher") or {}),
         # Settings that change at fixed epochs: a list of {epoch: N, setting: value, ...}.
         "knob_schedule": list(raw.get("knob_schedule") or []),
+        # The trainer profile ("1.1", "1.2") and per-slot part overrides.
+        # ``train: {trainer: ...}`` (where Studio writes a changed setting) wins over the top level.
+        "trainer": next((str(v) for v in (train.get("trainer"), raw.get("trainer")) if v is not None), None),
+        "parts": dict(raw.get("parts") or {}),
     }
     for key, value in raw.items():
         if key in reserved or not isinstance(value, dict):

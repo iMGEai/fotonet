@@ -95,7 +95,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
 
 
 def cmd_autolabel(args: argparse.Namespace) -> None:
-    """Batch inference using Fotonet v1.1 direct LTRB head to generate YOLO annotations."""
+    """Batch inference using fotonet v1.1 direct LTRB head to generate YOLO annotations."""
     from PIL import Image
     from fotonet.versions.v1_1.api import FotonetV11
 

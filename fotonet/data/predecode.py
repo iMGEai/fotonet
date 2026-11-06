@@ -56,13 +56,16 @@ def _decode(path):
     except ImportError:  # pragma: no cover - PIL fallback
         cv2 = None
     if cv2 is not None:
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Failed to read image: {path}")
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     from PIL import Image
 
-    return np.asarray(Image.open(path).convert("RGB"))
+    from PIL import ImageOps
+
+    with Image.open(path) as image:
+        return np.asarray(ImageOps.exif_transpose(image).convert("RGB"))
 
 
 def _resize_cap(img, max_side):

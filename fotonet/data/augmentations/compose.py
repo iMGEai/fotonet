@@ -229,6 +229,101 @@ def _load_mosaic_once(dataset, index, imgsz):
     return out_img, np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), source_count
 
 
+def load_mosaic_v2(dataset, index, imgsz=None, max_retries=2):
+    """``aug.mosaic@1.2`` on the CPU path: the zoom and shift applied to the whole 2x canvas.
+
+    Same semantics as ``fotonet.data.gpu_loader.mosaic_geometry_v2``: canvas point ``p`` lands at
+    ``k * (p - imgsz) + imgsz / 2 + t``, so a zoom-out shows more of the four images instead of gray
+    borders. The caller marks the sample ``pre_zoom`` so the GPU affine skips its zoom and shift.
+    """
+    imgsz = int(imgsz or dataset.imgsz)
+    best = None
+    for _ in range(max_retries + 1):
+        img, boxes, labels, source_count = _load_mosaic_v2_once(dataset, index, imgsz)
+        if source_count == 0 or len(labels) > 0:
+            return img, boxes, labels
+        if best is None:
+            best = (img, boxes, labels)
+    return best
+
+
+def _load_mosaic_v2_once(dataset, index, imgsz):
+    import cv2
+
+    hyp = dataset.augment_hyp
+    scl = float(hyp.get("scale", 0.0))
+    trn = float(hyp.get("translate", 0.0))
+    k = random.uniform(max(1.0 - scl, 0.05), 1.0 + scl)
+    tx = random.uniform(-trn, trn) * imgsz
+    ty = random.uniform(-trn, trn) * imgsz
+    indices = [index] + [_sample_dataset_index(dataset) for _ in range(3)]
+    center_x = int(random.uniform(imgsz * 0.5, imgsz * 1.5))
+    center_y = int(random.uniform(imgsz * 0.5, imgsz * 1.5))
+    large = imgsz * 2
+    canvas = np.full((large, large, 3), 114, dtype=np.uint8)
+    all_boxes, all_labels = [], []
+    source_count = 0
+    for slot, idx in enumerate(indices):
+        img, target = dataset.get_raw(idx)
+        boxes, labels = target["boxes"], target["labels"]
+        source_count += len(labels)
+        img = resize_longest_side(img, imgsz)
+        h, w = img.shape[:2]
+        if slot == 0:
+            x1a, y1a, x2a, y2a = max(center_x - w, 0), max(center_y - h, 0), center_x, center_y
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+        elif slot == 1:
+            x1a, y1a, x2a, y2a = center_x, max(center_y - h, 0), min(center_x + w, large), center_y
+            x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+        elif slot == 2:
+            x1a, y1a, x2a, y2a = max(center_x - w, 0), center_y, center_x, min(large, center_y + h)
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+        else:
+            x1a, y1a, x2a, y2a = center_x, center_y, min(center_x + w, large), min(large, center_y + h)
+            x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+        if x2a <= x1a or y2a <= y1a or x2b <= x1b or y2b <= y1b:
+            continue
+        canvas[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+        if len(boxes) > 0:
+            xyxy = xywhn_to_xyxy(boxes, w, h)
+            # Only this part of the image is on the canvas.
+            xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], x1b, x2b) + (x1a - x1b)
+            xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], y1b, y2b) + (y1a - y1b)
+            area = xywhn_to_xyxy(boxes, w, h)
+            area = np.maximum(area[:, 2] - area[:, 0], 0.0) * np.maximum(area[:, 3] - area[:, 1], 0.0)
+            all_boxes.append(np.concatenate((xyxy, area[:, None]), 1))
+            all_labels.append(labels)
+    side = max(int(round(large * k)), 1)
+    f = side / large
+    scaled = cv2.resize(canvas, (side, side), interpolation=cv2.INTER_AREA if f < 1.0 else cv2.INTER_LINEAR)
+    # Output pixel q shows scaled-canvas pixel q - off.
+    off_x = int(round(imgsz * 0.5 + tx - f * imgsz))
+    off_y = int(round(imgsz * 0.5 + ty - f * imgsz))
+    out = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
+    qx1, qy1 = max(off_x, 0), max(off_y, 0)
+    qx2, qy2 = min(off_x + side, imgsz), min(off_y + side, imgsz)
+    if qx2 > qx1 and qy2 > qy1:
+        out[qy1:qy2, qx1:qx2] = scaled[qy1 - off_y:qy2 - off_y, qx1 - off_x:qx2 - off_x]
+    if not all_boxes:
+        return out, np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), source_count
+    rows = np.concatenate(all_boxes, 0)
+    labels = np.concatenate(all_labels, 0)
+    boxes = rows[:, :4] * f
+    boxes[:, [0, 2]] += off_x
+    boxes[:, [1, 3]] += off_y
+    original_area = rows[:, 4] * f * f
+    boxes = clip_boxes_xyxy(boxes, imgsz, imgsz)
+    box_w = boxes[:, 2] - boxes[:, 0]
+    box_h = boxes[:, 3] - boxes[:, 1]
+    visible = (box_w * box_h) / np.maximum(original_area, 1e-6)
+    keep = (box_w > 2.0) & (box_h > 2.0) & (visible > 0.1) & np.isfinite(boxes).all(axis=1)
+    boxes, labels = boxes[keep], labels[keep]
+    if len(boxes) == 0:
+        return out, np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), source_count
+    boxes, labels = sanitize_boxes_xywhn(xyxy_to_xywhn(boxes, imgsz, imgsz), labels)
+    return out, boxes, labels, source_count
+
+
 def finalize_sample(img, boxes, labels, hsv_h=0.0, hsv_s=0.0, hsv_v=0.0, fliplr=0.0, flipud=0.0, bgr=0.0):
     img, boxes = random_flip(img, boxes, fliplr=fliplr, flipud=flipud)
     img = augment_hsv_safe(img, hgain=hsv_h, sgain=hsv_s, vgain=hsv_v)

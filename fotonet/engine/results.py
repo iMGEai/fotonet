@@ -608,7 +608,7 @@ class Results:
         """Return the number of detections in this image result.
 
         This keeps a single ``Results`` object ergonomic in the same way as
-        the batch returned by :meth:`FOTONET.predict`: ``len(result)`` means
+        the batch returned by :meth:`Fotonet.predict`: ``len(result)`` means
         detections, while ``len(results)`` means images.
         """
         return len(self.boxes)
@@ -814,7 +814,7 @@ class Results:
         return pd.DataFrame(data)
 
     def __repr__(self):
-        return f"FOTONET Results: {len(self.boxes)} detections"
+        return f"fotonet Results: {len(self.boxes)} detections"
 
     def cpu(self):
         """Return a copy whose tensors live on CPU for NumPy/Pandas consumers."""

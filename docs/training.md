@@ -49,6 +49,37 @@ training:
 fotonet train model=fotonete data=path/to/data.yaml dry_run=true
 ```
 
+## Trainer 1.2
+
+fotonet 1.2 adds a second trainer for the v1.1 family. The model is the same;
+only the training changes. The published `fotonetn` weights were trained with
+it. What it changes:
+
+- a stronger loss on the deployed head, so it keeps fewer duplicate boxes
+- a warmup, stable and decay learning-rate schedule
+- the image size steps up during training (512, then 576, then 640 px)
+- a mosaic that zooms and shifts the whole canvas
+- guard rails during training: duplicates, precision and recall on part of
+  the validation set, and a forecast of the final mAP
+
+Train `fotonetn` from scratch with it:
+
+```bash
+fotonet train \
+  model=fotonetn \
+  pretrained=False \
+  data=path/to/data.yaml \
+  recipe=fotonetn_scratch_v12 \
+  out_dir=runs/fotonetn
+```
+
+`pretrained=False` matters: without it, `model=fotonetn` starts from the
+published weights and fine-tunes them.
+
+A recipe picks its trainer with the `trainer` key (`"1.1"` or `"1.2"`); recipes
+that name none use 1.1, the trainer behind the first `fotonetn` weights. Both
+stay available.
+
 ## Resume after interruption
 
 ```bash

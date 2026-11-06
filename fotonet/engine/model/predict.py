@@ -287,8 +287,15 @@ class PredictMixin:
         save_dir.mkdir(parents=True, exist_ok=True)
         self.last_save_dir = str(save_dir)
 
+        used = set()
+
         def saver(result, index):
             stem = Path(getattr(result, "path", None) or f"{index:06d}").stem
+            # A folder can hold a/x.jpg and b/x.jpg; never let one overwrite the other.
+            base, n = stem, 2
+            while stem.lower() in used:
+                stem, n = f"{base}_{n}", n + 1
+            used.add(stem.lower())
             if save:
                 result.save(str(save_dir / f"{stem}.jpg"))
             if save_txt:

@@ -1,0 +1,106 @@
+# FOTONET v1.2 scratch recipe: fotonets, trained with the v1.2 trainer (docs/internal/v1_2_trainer_plan.md).
+# Same model as fotonets_scratch (layout, parameters and fingerprint unchanged); only training differs.
+# Every training setting matches fotonetn_scratch_v12 except the ones listed here:
+#   - 300 epochs instead of 500, so the run fits a cloud GPU budget: 5 warmup + 115 stable + 180 decay
+#     (the same 60% decay share as fotonetn_scratch_v12's 300 of 500).
+#   - workers 8: cloud machines have more cores than the 4-core reference box (the loop caps it at
+#     the core count anyway).
+# Written 2026-11-02 for the first fotonets run on Google Colab (G4, RTX PRO 6000 Blackwell).
+
+model: fotonets
+pretrained: false
+resume: false
+trainer: "1.2"
+
+train:
+  epochs: 300
+  imgsz: 640
+  # 512 px for epochs 1-24, 576 px for 25-48, 640 px from 49 on (same fractions as fotonetn_scratch_v12).
+  imgsz_schedule:
+    - [0.08, 512]
+    - [0.08, 576]
+    - [0.84, 640]
+  nbs: 128
+  batch: 16
+  workers: 8
+  predecode: false
+  predecode_dir: null
+  predecode_max_side: 720
+  close_mosaic: 25
+  out_dir: runs/train
+  lr_scheduler: wsd
+  # 5 warmup + 115 stable + 180 decay epochs.
+  wsd_decay_epochs: 180
+  wsd_shape: cosine
+  wsd_decay_fraction: 0.60
+  grad_clip: 10.0
+  val_period: 5
+  val_final_epochs: 50
+  val_batch: 8
+  val_workers: 2
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 5.0
+  forecast: true
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 5
+  ema_decay: 0.99985
+  ema_tau: 2000
+
+augment:
+  mosaic: 0.90
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.562
+  fliplr: 0.606
+  flipud: 0.0
+  degrees: 1.11
+  shear: 1.46
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.106
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  quality_start_epoch: 3
+  quality_warmup_epochs: 8
+  center_prior_epochs: 6
+  o2o_prior_epochs: 6
+  o2o_cls: bce
+  o2o_q_gamma: 1.0
+  w_runner_up: 1.5
+  o2o_neg_alpha: 1.0
+  o2o_neg_gamma: 1.0
+
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  o2o_metric: consistent
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+  o2m_target: iou
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

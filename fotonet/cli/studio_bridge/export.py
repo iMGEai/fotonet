@@ -16,7 +16,7 @@ from .protocol import emit_result, validate_v11_model_id
 def cmd_export(args: argparse.Namespace) -> None:
     """
     Multi-target export (ONNX, TensorRT, CoreML, TorchScript) with Conv-BN fusion
-    and mathematical L1 < 1e-5 numerical parity verification.
+    and an ONNX Runtime parity check (the same tolerance as the exporter's own).
     """
     import torch
     import numpy as np
@@ -55,13 +55,20 @@ def cmd_export(args: argparse.Namespace) -> None:
         in_name = session.get_inputs()[0].name
         out_name = session.get_outputs()[0].name
 
-        dummy = torch.zeros(1, 3, imgsz, imgsz, device=model.device)
+        # Reference on the CPU in FP32, like ONNX Runtime here: CUDA convolutions
+        # run in TF32 by default and differ by ~1e-3 relative.
+        import copy
+
+        dummy = torch.zeros(1, 3, imgsz, imgsz)
         with torch.no_grad():
-            ref_out = model.model(dummy).detach().cpu().numpy()
+            ref_out = copy.deepcopy(model.model).float().cpu().eval()(dummy).numpy()
         onnx_out = session.run([out_name], {in_name: dummy.detach().cpu().numpy()})[0]
 
+        # The export is fused (and maybe FP16) while the reference is not, so an
+        # absolute 1e-5 bound on logits of size ~25 failed on float rounding alone.
+        rtol, atol = (1e-2, 2e-3) if use_half else (2e-3, 2e-4)
         l1_diff = float(np.max(np.abs(onnx_out - ref_out)))
-        parity_passed = bool(l1_diff < 1e-5)
+        parity_passed = bool(np.allclose(onnx_out, ref_out, rtol=rtol, atol=atol))
 
         size_mb = round(os.path.getsize(artifact) / (1024 * 1024), 2)
         emit_result({
@@ -72,7 +79,8 @@ def cmd_export(args: argparse.Namespace) -> None:
             "size_mb": size_mb,
             "parity": {
                 "l1_max_error": l1_diff,
-                "threshold": 1e-5,
+                "rtol": rtol,
+                "atol": atol,
                 "passed": parity_passed,
             },
         })
@@ -174,7 +182,7 @@ def cmd_codegen(args: argparse.Namespace) -> None:
     if target_lang in ("python", "py"):
         code = f'''#!/usr/bin/env python3
 """
-Fotonet v1.1 Standalone Python Inference (Zero Framework)
+fotonet v1.1 standalone Python inference (no framework)
 =========================================================
 Runs NMS-free direct LTRB object detection with ONNX Runtime and NumPy.
 """
@@ -216,7 +224,7 @@ def main():
         sys.exit(1)
         
     image_file = sys.argv[1]
-    image_bgr = cv2.imread(image_file)
+    image_bgr = cv2.imdecode(np.fromfile(image_file, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image_bgr is None:
         print(f"Error: Could not read image {{image_file}}")
         sys.exit(1)
@@ -277,7 +285,7 @@ if __name__ == "__main__":
         instructions = "Run: pip install opencv-python numpy onnxruntime && python inference.py image.jpg"
 
     elif target_lang in ("cpp", "c++"):
-        code = f'''// Fotonet v1.1 Standalone C++ Inference with ONNX Runtime
+        code = f'''// fotonet v1.1 Standalone C++ Inference with ONNX Runtime
 // Compile: g++ -O3 main.cpp -lonnxruntime `pkg-config --cflags --libs opencv4` -o fotonet_infer
 
 #include <iostream>
@@ -353,7 +361,7 @@ int main(int argc, char** argv) {{
         instructions = "Compile with g++ and link against OpenCV and ONNX Runtime."
 
     elif target_lang in ("node", "nodejs", "javascript", "js"):
-        code = f'''// Fotonet v1.1 Standalone Node.js Inference (onnxruntime-node)
+        code = f'''// fotonet v1.1 Standalone Node.js Inference (onnxruntime-node)
 // Install: npm install onnxruntime-node sharp
 const ort = require('onnxruntime-node');
 const sharp = require('sharp');

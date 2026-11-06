@@ -265,6 +265,13 @@ class GpuAugmenter:
                              torch.tan(U(-shr, shr) * math.pi / 180.0)), -1)
         tx = U(-trn, trn) * imgs_u8.shape[-1]
         ty = U(-trn, trn) * imgs_u8.shape[-2]
+        pre = [bool(t.get("pre_zoom", False)) for t in targets]
+        if any(pre):
+            # aug.mosaic@1.2 already zoomed and shifted these mosaics on the whole canvas, in the worker.
+            done = torch.tensor(pre, device=dev)
+            scale = torch.where(done, torch.ones_like(scale), scale)
+            tx = torch.where(done, torch.zeros_like(tx), tx)
+            ty = torch.where(done, torch.zeros_like(ty), ty)
         hg = float(hyp.get("hsv_h", 0.0))
         sgn = float(hyp.get("hsv_s", 0.0))
         vgn = float(hyp.get("hsv_v", 0.0))

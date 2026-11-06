@@ -10,6 +10,11 @@ from fotonet.train.losses import o2o_branch_loss
 from fotonet.train.assign import o2o_group_targets
 from .data import _m_bucket
 
+# Keyword options each v2 part takes on top of its v1 signature (trainer/profiles.py, profile "1.2").
+_MATCH_V2_KEYS = ("o2m_target",)
+_LOSS_V2_KEYS = ("o2o_cls", "o2o_q_gamma")
+_GROUP_V2_KEYS = ("o2o_cls", "o2o_q_gamma", "o2o_neg_alpha", "o2o_neg_gamma")
+
 
 def _bank_grads(params, bank, banked, finite):
     """Move one micro-batch's gradients into a flat bank; a non-finite batch adds zeros.
@@ -122,7 +127,7 @@ class TrainStep:
 
     def __init__(self, *, cfg, model, compiled, match, loss, opt, ema, scaler, augmenter, dev, mmax,
                  use_compile, use_amp, amp_dtype, channels_last, decode_targets, teacher, single_cls,
-                 groups_on, accum_steps, prof):
+                 groups_on, accum_steps, prof, match_v2=False, loss_v2=False, group_assign=None, group_loss=None):
         self.cfg = cfg
         self.model = model
         self.compiled = compiled
@@ -144,17 +149,24 @@ class TrainStep:
         self.groups_on = groups_on
         self.accum_steps = accum_steps
         self.prof = prof
+        self.match_v2 = bool(match_v2)
+        self.loss_v2 = bool(loss_v2)
+        self.group_assign = group_assign if group_assign is not None else o2o_group_targets
+        self.group_loss = group_loss if group_loss is not None else o2o_branch_loss
+        self.group_v2 = self.group_loss is not o2o_branch_loss
         self.grad_params = [p for p in model.parameters() if p.requires_grad]
         self.bank, self.banked = None, None
         self.gt_overflow = 0
 
-    def __call__(self, imgs, targets, *, epoch, step_i, n_steps, lr, quality_mix, prior_mix, use_o2m):
+    def __call__(self, imgs, targets, *, epoch, step_i, n_steps, lr, quality_mix, prior_mix, use_o2m,
+                 o2o_prior_mix=None):
         """Run one micro-step. Returns ``(loss row, dropped-batch count, batch size)`` as device tensors."""
         images, gtmap, lab, mask, gt_weight = self._batch(imgs, targets)
         self.prof.mark("augment")
         for group in self.opt.param_groups:
             group["lr"] = lr
-        total, parts, finite = self._losses(images, gtmap, lab, mask, gt_weight, use_o2m, quality_mix, prior_mix)
+        total, parts, finite = self._losses(images, gtmap, lab, mask, gt_weight, use_o2m, quality_mix, prior_mix,
+                                            o2o_prior_mix)
         # The last window of an epoch can be short (n_steps not a multiple of
         # accum_steps); average over the batches it really has.
         window_start = (step_i // self.accum_steps) * self.accum_steps
@@ -205,7 +217,7 @@ class TrainStep:
             images = images.contiguous(memory_format=torch.channels_last)
         return images, gtmap, lab, mask, gt_weight
 
-    def _losses(self, images, gtmap, lab, mask, gt_weight, use_o2m, qm, prior):
+    def _losses(self, images, gtmap, lab, mask, gt_weight, use_o2m, qm, prior, o2o_prior=None):
         """Forward, matching, and loss. Returns ``(masked total, loss parts, finite flag)``."""
         cfg = self.cfg
         if self.use_amp:
@@ -234,6 +246,7 @@ class TrainStep:
             quality_mix=qm, prior_mix=prior,
             o2o_metric=str(cfg["o2o_metric"]), candidates=int(cfg["matcher_candidates"]),
             gt_weight=gt_weight, return_state=self.groups_on,
+            **({"o2o_prior_mix": o2o_prior, **{k: cfg[k] for k in _MATCH_V2_KEYS}} if self.match_v2 else {}),
         )
         (tgt_m, tgt_o, wgt_m, wgt_o, sb_m, sa_m, sg_m, rw_m, sb_o, sa_o, sg_o, rw_o) = matched[:12]
         values = self.loss(
@@ -246,22 +259,24 @@ class TrainStep:
             preds_obj_o2m=None if o2m_obj is None else o2m_obj.float(),
             w_obj=float(cfg["w_obj"]), w_runner_up=float(cfg["w_runner_up"]),
             o2o_neg_alpha=float(cfg["o2o_neg_alpha"]), o2o_neg_gamma=float(cfg["o2o_neg_gamma"]),
+            **({k: cfg[k] for k in _LOSS_V2_KEYS} if self.loss_v2 else {}),
         )
         total, l_cls, l_box, l_cls_m, l_box_m, l_cons, l_obj = values
         if self.groups_on and "pred_logits_o2o_groups" in out:
             state = matched[12]
             for g_logits, g_boxes in zip(out["pred_logits_o2o_groups"], out["pred_boxes_o2o_groups"]):
                 g_logits, g_boxes = g_logits.float(), g_boxes.float()
-                g_targets = o2o_group_targets(
+                g_targets = self.group_assign(
                     state, g_logits, g_boxes, o2o_topk=int(cfg["o2o_topk"]),
                     o2o_metric=str(cfg["o2o_metric"]), alpha=float(cfg["alpha"]),
                     beta=float(cfg["beta"]), o2o_beta=float(cfg["o2o_beta"]),
                     o2o_center_prior=float(cfg["o2o_center_prior"]), quality_mix=qm,
                     gt_weight=gt_weight,
                 )
-                g_loss, _, _ = o2o_branch_loss(
+                g_loss, _, _ = self.group_loss(
                     g_logits, g_boxes, *g_targets, gtmap, w_box=float(cfg["w_box"]),
                     iou_type=str(cfg["iou_type"]),
+                    **({k: cfg[k] for k in _GROUP_V2_KEYS} if self.group_v2 else {}),
                 )
                 total = total + float(cfg["w_group"]) * g_loss
         self.prof.mark("assign_loss")

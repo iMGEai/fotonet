@@ -67,7 +67,13 @@ class _TrainDataset(GeometryMixin, DetectionDataset):
 
         hyp = self.augment_hyp
         use_mosaic = self._mosaic_enabled() and np.random.random() < hyp.get("mosaic", 0.0)
-        if use_mosaic:
+        pre_zoom = False
+        if use_mosaic and int(getattr(self, "mosaic_version", 1) or 1) >= 2:
+            from fotonet.data.augmentations.compose import load_mosaic_v2
+
+            img, boxes, labels = load_mosaic_v2(self, idx, self.imgsz)
+            pre_zoom = True
+        elif use_mosaic:
             img, boxes, labels = load_mosaic(self, idx, self.imgsz)
         else:
             img, target = self.get_raw(idx)
@@ -87,6 +93,8 @@ class _TrainDataset(GeometryMixin, DetectionDataset):
                 alpha=hyp.get("mixup_alpha", 32.0),
             )
         boxes, labels = sanitize_boxes_xywhn(boxes, labels)
+        # Set last: a mixup partner's own call above must not decide it.
+        self._last_pre_zoom = pre_zoom
         return img, boxes, labels
 
     def __getitem__(self, idx):
@@ -96,13 +104,13 @@ class _TrainDataset(GeometryMixin, DetectionDataset):
             return super().__getitem__(idx)
         img, boxes, labels = self._geometric_sample(idx, True)
         chw = np.ascontiguousarray(img.transpose(2, 0, 1))
-        return (
-            torch.from_numpy(chw),
-            {
-                "boxes": torch.from_numpy(boxes.astype(np.float32, copy=False)),
-                "labels": torch.from_numpy(labels.astype(np.int64, copy=False)),
-            },
-        )
+        target = {
+            "boxes": torch.from_numpy(boxes.astype(np.float32, copy=False)),
+            "labels": torch.from_numpy(labels.astype(np.int64, copy=False)),
+        }
+        if getattr(self, "_last_pre_zoom", False):
+            target["pre_zoom"] = True
+        return torch.from_numpy(chw), target
 
 
 def _collate(batch):

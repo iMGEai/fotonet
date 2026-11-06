@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from fotonet.data.augmentations.hyp import build_augment_hyp
 from fotonet.data.dataset import build_detection_dataset
 from fotonet.engine.runtime import configure_data_worker
-from fotonet.registry import lockfile
+from fotonet.registry import canonical_version, lockfile
 from fotonet.utils.config import default_class_names
 from fotonet.utils.console import (
     AgyProgressBar, format_eta, log_event, print_completion_card, print_epoch_summary, print_train_card,
@@ -40,6 +40,30 @@ from .state import _EMA, _freeze, _resolve_training_model, _run_dir, capture_rng
 from .callbacks import _callbacks, _fire
 from .step import _EagerFallback, TrainStep
 from .live import LIVE_KEYS as LIVE_KEYS_SET, KnobSchedule, LiveTuner, SCHEDULE_KEYS
+from .profiles import PROFILE_DEFAULTS, after_v11, profile_name, resolve_parts
+from fotonet.train.probes import head_matrix, LivePreview
+from fotonet.train.forecast import plan_arrays, write_forecast
+
+
+def _write_json(path, payload):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp, path)
+
+
+def _read_rows(path):
+    rows = []
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+    return rows
 
 
 def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
@@ -47,8 +71,20 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     callbacks = _callbacks(kwargs.pop("callbacks", None))
     cfg = dict(DEFAULTS)
     recipe_cfg = _recipe_overrides(recipe)
-    cfg.update({key: value for key, value in recipe_cfg.items() if key not in ("augment_hyp", "knob_schedule")})
+    # The trainer profile first: its defaults sit under the recipe and the command line.
+    profile = profile_name(kwargs.get("trainer") or recipe_cfg.get("trainer") or DEFAULTS["trainer"])
+    cfg.update(PROFILE_DEFAULTS[profile])
+    cfg.update({key: value for key, value in recipe_cfg.items() if key not in ("augment_hyp", "knob_schedule", "parts")})
     cfg.update({key: value for key, value in kwargs.items() if key in DEFAULTS and value is not None})
+    cfg["trainer"] = profile
+    part_overrides = kwargs.get("parts")
+    if part_overrides is None:
+        part_overrides = recipe_cfg.get("parts")
+    run_parts = resolve_parts(profile, part_overrides)
+    matcher_part = run_parts["assigner"].obj
+    loss_part = run_parts["loss"].obj
+    lr_part = run_parts["lr_schedule"].obj
+    mosaic_version = 2 if after_v11(run_parts["mosaic"]) else 1
     knob_steps = kwargs.get("knob_schedule")
     if knob_steps is None:
         knob_steps = recipe_cfg.get("knob_schedule")
@@ -56,6 +92,10 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     cfg["imgsz"] = side
     if float(cfg.get("w_dfl") or 0.0) != 0.0:
         log_event("w_dfl is ignored: v1.1 direct regression has no distribution-focal term.", level="warn")
+    if float(cfg.get("warmup_epochs") or 0.0) >= int(cfg.get("epochs") or 0) > 0:
+        # Only a message: a short fine-tune with the scratch recipe's warmup never reaches its learning rate.
+        log_event(f"warmup_epochs={cfg['warmup_epochs']} covers the whole {cfg['epochs']}-epoch run, so the "
+                  "learning rate never reaches its peak; set warmup_epochs below epochs.", level="warn")
     aug_hyp = build_augment_hyp({
         **dict(recipe_cfg.get("augment_hyp") or {}),
         **dict(kwargs.get("augment_hyp") or {}),
@@ -180,6 +220,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         )
         dataset.jpeg_decoder = jpeg_decoder
         dataset.mosaic_buffer = max(int(cfg["mosaic_buffer"] or 0), 0)
+        # aug.mosaic@1.2 leaves the rotation, shear and colour to the GPU augmenter.
+        dataset.mosaic_version = mosaic_version if gpu_aug else 1
         if labels is not None:
             dataset.cache = labels
         if max_images and max_images < len(dataset.img_files):
@@ -252,6 +294,17 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         ckpt = load_checkpoint(rpath, map_location=dev)
         if ckpt.get("format") != V11_FORMAT or "optimizer" not in ckpt or "ema" not in ckpt:
             raise SystemExit(f"{rpath} is not a v1.1 training checkpoint (need model, optimizer, and ema).")
+        # A checkpoint from before a part's rename names its old version; compare the current ones.
+        saved_parts = {name: canonical_version(name, version) for name, version in dict(ckpt.get("parts") or {}).items()}
+        mismatch = sorted(
+            f"{info.name}: checkpoint {saved_parts[info.name]}, this run {info.version}"
+            for info in run_parts.values() if info.name in saved_parts and saved_parts[info.name] != info.version
+        )
+        if mismatch and kwargs.get("trainer") is None and kwargs.get("parts") is None:
+            raise SystemExit(
+                f"{rpath} was trained with other training parts ({'; '.join(mismatch)}). Resume with the "
+                f"same trainer profile, or name trainer= or parts= on purpose to switch."
+            )
         load_weights(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
         ema.load_state_dict(ckpt["ema"])
@@ -270,19 +323,19 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         log_event(f"Resumed {rpath} at epoch {start_epoch} (best {best_map:.4f}).")
 
     compiled = model
-    match = matcher_fn
-    loss = loss_fn
+    match = matcher_part
+    loss = loss_part
     use_compile = _resolve_compile(cfg["compile"], dev, steps_per_epoch * int(cfg["epochs"]))
     if use_compile:
         try:
             torch._dynamo.config.recompile_limit = 16
             compiled = _EagerFallback(torch.compile(model, dynamic=False), model, "model")
-            match = _EagerFallback(torch.compile(matcher_fn, dynamic=False), matcher_fn, "matcher")
-            loss = _EagerFallback(torch.compile(loss_fn, dynamic=False), loss_fn, "loss")
+            match = _EagerFallback(torch.compile(matcher_part, dynamic=False), matcher_part, "matcher")
+            loss = _EagerFallback(torch.compile(loss_part, dynamic=False), loss_part, "loss")
             log_event("torch.compile enabled for the model, matcher, and loss (first steps compile).")
         except Exception as exc:
             log_event(f"torch.compile skipped ({exc}).", level="warn")
-            compiled, match, loss = model, matcher_fn, loss_fn
+            compiled, match, loss = model, matcher_part, loss_part
             use_compile = False
 
     val_loader = None
@@ -310,7 +363,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             val_model = val_model.to(memory_format=torch.channels_last)
 
     epochs = int(cfg["epochs"])
-    plan = _Schedule(cfg, epochs, steps_per_epoch)
+    plan = _Schedule(cfg, epochs, steps_per_epoch, lr_fn=lr_part)
     lr0, lrf = float(cfg["lr0"]), float(cfg["lrf"])
     gstep = (start_epoch - 1) * steps_per_epoch
     print_train_card(
@@ -355,13 +408,48 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     groups_on = int(cfg["o2o_groups"]) > 1
     lr_now = lr0
     # Training parts used by this run, recorded in every checkpoint next to the model's own.
-    train_parts = lockfile([loss_fn, matcher_fn, o2o_group_targets, _EMA, _lr_at, _epoch_ramp])
+    train_parts = lockfile([loss_part, matcher_part, run_parts["group_assigner"].obj, run_parts["group_loss"].obj,
+                            _EMA, lr_part, _epoch_ramp, run_parts["mosaic"].obj])
     step = TrainStep(
         cfg=cfg, model=model, compiled=compiled, match=match, loss=loss, opt=opt, ema=ema, scaler=scaler,
         augmenter=augmenter, dev=dev, mmax=mmax, use_compile=use_compile, use_amp=use_amp,
         amp_dtype=amp_dtype, channels_last=channels_last, decode_targets=decode_targets, teacher=teacher,
         single_cls=single_cls, groups_on=groups_on, accum_steps=accum_steps, prof=prof,
+        match_v2=after_v11(run_parts["assigner"]), loss_v2=after_v11(run_parts["loss"]),
+        group_assign=run_parts["group_assigner"].obj, group_loss=run_parts["group_loss"].obj,
     )
+    # What Studio and the forecast need about this run: its parts and its whole plan, per epoch.
+    ema_tau_epochs = (1.0 / max(1.0 - float(cfg["ema_decay"]), 1e-9)) / max(steps_per_epoch / accum_steps, 1.0)
+    info_path = os.path.join(out_dir, "run_info.json")
+
+    def write_run_info():
+        lrs, sizes, mos = plan.plan(lr0, lrf, side, aug_hyp.get("mosaic", 0.0))
+        try:
+            _write_json(info_path, {
+                "trainer": profile, "parts": {slot: info.ref for slot, info in run_parts.items()},
+                "lockfile": train_parts, "model": model.model_id, "recipe": str(recipe) if recipe else None,
+                "epochs": epochs, "steps_per_epoch": steps_per_epoch, "accum_steps": accum_steps,
+                "batch": int(cfg["batch"]), "lr0": lr0, "lrf": lrf, "lr_scheduler": plan.kind,
+                "wsd_shape": plan.shape, "warmup_epochs": int(cfg["warmup_epochs"]),
+                "decay_epoch": plan.decay_epoch(), "close_mosaic_epoch": plan.close_from,
+                "mosaic_version": mosaic_version if gpu_aug else 1, "val_period": int(cfg["val_period"]),
+                "val_final_epochs": plan.val_final, "probe_period": int(cfg["probe_period"]),
+                "preview_minutes": float(cfg["preview_minutes"]), "ema_tau_epochs": round(ema_tau_epochs, 3),
+                "o2o_cls": cfg["o2o_cls"], "o2o_prior_epochs": int(cfg["o2o_prior_epochs"]),
+                "plan": {"lr": [round(v, 8) for v in lrs], "imgsz": sizes, "mosaic": mos},
+            })
+        except OSError as exc:
+            log_event(f"run_info.json not written ({exc}).", level="warn")
+        return plan_arrays(lrs, sizes, mos)
+
+    forecast_plan = write_run_info()
+    history = [row for row in _read_rows(metrics_path) if int(row.get("epoch", 0) or 0) < start_epoch]
+    preview = None
+    if val_loader is not None:
+        preview = LivePreview(out_dir, ds, val_ds.dataset if isinstance(val_ds, _SingleClassView) else val_ds,
+                              names, side)
+    probe_failures = 0
+    log_event(f"trainer {profile}: " + ", ".join(info.ref for info in run_parts.values()))
     tuner = LiveTuner(out_dir, cfg, aug_hyp, log_event) if bool(cfg["live_tuning"]) else None
     if (tuner is not None or schedule is not None) and use_compile:
         # Live and scheduled changes reach the compiled step as new Python constants; allow more recompiles than the default.
@@ -379,8 +467,9 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             keys = set(applied) | set(scheduled)
             lr0, lrf = float(cfg["lr0"]), float(cfg["lrf"])
             if keys & SCHEDULE_KEYS:
-                plan = _Schedule(cfg, epochs, steps_per_epoch)
+                plan = _Schedule(cfg, epochs, steps_per_epoch, lr_fn=lr_part)
                 aug_hyp["close_mosaic"] = int(cfg["close_mosaic"])
+                forecast_plan = write_run_info()
             if "weight_decay" in keys:
                 for group in opt.param_groups:
                     if float(group.get("weight_decay", 0.0)) > 0.0:
@@ -416,6 +505,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                 gc.collect()
                 torch.cuda.empty_cache()
             model.set_imgsz(int(ds.imgsz))
+            if preview is not None:
+                preview.train = ds
             if augmenter is not None:
                 augmenter.imgsz = int(want)
             note = [f"imgsz {want}"]
@@ -430,6 +521,14 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             prior = torch.tensor(1.0 - _epoch_ramp(epoch - 1, 1, prior_epochs), device=dev)
         else:
             prior = torch.tensor(1.0 - quality, device=dev)
+        # The one-to-one rule's own prior (assign.dual_o2o_o2m@1.2): -1 follows the O2M prior as v1.
+        o2o_epochs = int(cfg["o2o_prior_epochs"])
+        if o2o_epochs < 0:
+            o2o_prior = prior
+        elif o2o_epochs == 0:
+            o2o_prior = None
+        else:
+            o2o_prior = torch.tensor(1.0 - _epoch_ramp(epoch - 1, 1, o2o_epochs), device=dev)
         bar = AgyProgressBar(total=len(loader), desc="train", epoch=epoch, total_epochs=epochs, unit="it", window_size=50)
         bar.set_phase(plan.phase(epoch, gstep, cfg["warmup_epochs"]))
         sums = None
@@ -448,7 +547,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             lr_now = plan.lr(gstep, lr0, lrf) * float(cfg["lr_scale"])
             row, dropped, batch_images = step(
                 imgs, targets, epoch=epoch, step_i=step_i, n_steps=len(loader), lr=lr_now,
-                quality_mix=qm, prior_mix=prior, use_o2m=use_o2m,
+                quality_mix=qm, prior_mix=prior, use_o2m=use_o2m, o2o_prior_mix=o2o_prior,
             )
             skipped = skipped + dropped
             sums = row if sums is None else sums + row
@@ -465,6 +564,12 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                     f"{step_i / elapsed:.2f} it/s, {step_i * int(cfg['batch']) / elapsed:.0f} img/s"
                 )
             prof.end_step(batch_images)
+            if preview is not None and (step_i % 50 == 0 or step_i == len(loader)) and preview.due(cfg["preview_minutes"]):
+                val_model.load_state_dict(ema.deploy_state(model), strict=True)
+                shot = preview.run(val_model, dev, epoch, step_i, len(loader),
+                                   amp=bool(cfg["val_amp"]) and dev.type == "cuda", channels_last=channels_last)
+                if shot and "error" in shot:
+                    log_event(f"live preview failed ({shot['error']}).", level="warn")
         bar.close()
         if prof.finished and not profile_written:
             summary = prof.write(os.path.join(out_dir, "profile.json"))
@@ -488,6 +593,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             "images_seen": int(gstep) * int(cfg["batch"]),
             "elapsed_seconds": round(time.perf_counter() - t_run, 3),
             "skipped_steps": skipped_steps,
+            "phase": plan.phase(epoch, gstep - 1, cfg["warmup_epochs"]),
+            "mosaic": round(float(mosaic_p), 4),
         }
         if applied:
             entry["live_changes"] = {key: new for key, (_old, new) in applied.items()}
@@ -512,8 +619,36 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                 best_map, best_epoch = score, epoch
                 is_best = True
             _fire(callbacks, "on_val_end", {"epoch": epoch, "metrics": val_metrics})
+        period = int(cfg["probe_period"] or 0)
+        if preview is not None and period > 0 and probe_failures < 3 and (epoch % period == 0 or epoch == epochs):
+            try:
+                if val_metrics is None:
+                    val_model.load_state_dict(ema.deploy_state(model), strict=True)
+                probe = head_matrix(
+                    val_model, preview.val, dev, side, n_images=int(cfg["probe_images"]), batch=int(cfg["val_batch"]),
+                    amp=bool(cfg["val_amp"]) and dev.type == "cuda", channels_last=channels_last,
+                )
+                if probe:
+                    entry.update(probe)
+                    log_event(
+                        f"epoch {epoch} probe ({probe['probe_images']} val images): o2o {probe['probe_o2o']}, "
+                        f"o2o+NMS {probe['probe_o2o_nms']}, o2m+NMS {probe['probe_o2m_nms']}; P/R at 0.25 "
+                        f"{probe['probe_precision']}%/{probe['probe_recall']}%; duplicates {probe['probe_dup_rate']}%"
+                    )
+            except Exception as exc:  # a probe must never stop training
+                probe_failures += 1
+                log_event(f"epoch {epoch}: probe failed ({type(exc).__name__}: {exc}).", level="warn")
         with open(metrics_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
+        history.append(entry)
+        if val_metrics is not None and bool(cfg["forecast"]):
+            try:
+                fc = write_forecast(out_dir, history, forecast_plan, ema_tau_epochs, metric=cfg["best_metric"])
+                if fc:
+                    log_event(f"forecast: final {cfg['best_metric']} {fc['final']:.2f} "
+                              f"(80%: {fc['low']:.2f}-{fc['high']:.2f}), from {fc['points']} scores")
+            except Exception as exc:
+                log_event(f"forecast failed ({type(exc).__name__}: {exc}).", level="warn")
         if writer is not None:
             for key, value in entry.items():
                 if isinstance(value, (int, float)) and key != "epoch":
@@ -549,7 +684,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             fitted = max(epoch, epoch + int(remaining // max(epoch_cost, 1e-6)))
             if fitted != epochs:
                 epochs = fitted
-                plan = _Schedule(cfg, epochs, steps_per_epoch)
+                plan = _Schedule(cfg, epochs, steps_per_epoch, lr_fn=lr_part)
+                forecast_plan = write_run_info()
                 ds.set_total_epochs(epochs)
                 log_event(f"time budget {cfg['time']} h: training {epochs} epochs ({epoch_cost:.0f} s each)")
         patience = int(cfg["patience"] or 0)
@@ -575,7 +711,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     completed = min(epoch, epochs) - start_epoch + 1
     print_completion_card({
         "training_wall_time_sec": time.perf_counter() - t_run,
-        "epochs_completed": completed,
+        # The epoch reached, not this session's count: a resume read "Epochs: 1/4" at the end.
+        "epochs_completed": min(epoch, epochs) if completed > 0 else start_epoch - 1,
         "epochs_requested": epochs,
         "best_score": best_map,
         "best_metric": cfg["best_metric"],

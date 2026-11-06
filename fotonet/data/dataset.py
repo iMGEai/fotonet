@@ -1,5 +1,6 @@
 import os
 import hashlib
+import warnings
 import time
 from pathlib import Path
 from collections import Counter, OrderedDict
@@ -290,9 +291,10 @@ class DetectionDataset(Dataset):
             return DetectionDataset._empty_label_result()
 
         try:
-            with open(label_path, "r", encoding="utf-8") as f:
+            # utf-8-sig: editors that save a BOM would otherwise cost the first row.
+            with open(label_path, "r", encoding="utf-8-sig") as f:
                 lines = f.readlines()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             issue("unreadable_label", detail=str(exc))
             return DetectionDataset._empty_label_result()
 
@@ -300,6 +302,14 @@ class DetectionDataset(Dataset):
             parts = line.split()
             if not parts:
                 continue
+            if len(parts) >= 7 and len(parts) % 2 == 1 and audit.policy != "error":
+                # A segmentation row (class x1 y1 x2 y2 ...): train on its bounding box.
+                boxed = DetectionDataset._polygon_row_to_box(parts)
+                if boxed is None:
+                    issue("malformed_label_row", line=line_no, detail="segment points are not numbers in [0, 1]")
+                    continue
+                issue("polygon_label_boxed", line=line_no, detail="segment points used as their bounding box", fatal=False)
+                parts = boxed
             if len(parts) != 5:
                 issue("malformed_label_row", line=line_no, detail="expected: class x_center y_center width height")
                 continue
@@ -381,6 +391,19 @@ class DetectionDataset(Dataset):
         }
 
     @staticmethod
+    def _polygon_row_to_box(parts):
+        """``class x1 y1 x2 y2 ...`` to ``class xc yc w h`` (strings), or None."""
+        try:
+            points = np.asarray([float(v) for v in parts[1:]], dtype=np.float64).reshape(-1, 2)
+        except ValueError:
+            return None
+        if not np.isfinite(points).all():
+            return None
+        points = points.clip(0.0, 1.0)
+        (x1, y1), (x2, y2) = points.min(0).tolist(), points.max(0).tolist()
+        return [parts[0], *map(repr, ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1))]
+
+    @staticmethod
     def _parse_label_item(args):
         idx, label_path, num_classes, audit = args
         result = DetectionDataset._parse_label_file(
@@ -436,7 +459,7 @@ class DetectionDataset(Dataset):
         try:
             with np.load(cache_path, allow_pickle=False) as data:
                 version = int(data["version"][0])
-                if version != 8:
+                if version != 9:
                     return False
                 saved_nc = int(data["num_classes"][0])
                 expected_nc = -1 if self.num_classes is None else int(self.num_classes)
@@ -531,7 +554,7 @@ class DetectionDataset(Dataset):
             with open(tmp_path, "wb") as f:
                 np.savez(
                     f,
-                    version=np.asarray([8], dtype=np.int64),
+                    version=np.asarray([9], dtype=np.int64),
                     num_classes=np.asarray([-1 if self.num_classes is None else int(self.num_classes)], dtype=np.int64),
                     image_paths=np.asarray([os.path.abspath(p) for p in self.img_files]),
                     label_paths=np.asarray([os.path.abspath(p) for p in label_paths]),
@@ -656,14 +679,17 @@ class DetectionDataset(Dataset):
 
     def _decode_image(self, img_path):
         if cv2 is not None:
-            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            # imdecode, not imread: imread cannot open non-ASCII paths on Windows.
+            buf = np.fromfile(img_path, dtype=np.uint8)
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR) if buf.size else None
             if img is None:
                 raise FileNotFoundError(f"Failed to read image: {img_path}")
             return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        from PIL import Image
+        from PIL import Image, ImageOps
 
-        return np.asarray(Image.open(img_path).convert("RGB"))
+        with Image.open(img_path) as image:
+            return np.asarray(ImageOps.exif_transpose(image).convert("RGB"))
 
     def _read_image(self, idx):
         img_path = self.img_files[idx]
@@ -740,12 +766,40 @@ class DetectionDataset(Dataset):
         return size
 
     def get_raw(self, idx):
-        img = self._get_cached_image(idx)
+        try:
+            img = self._get_cached_image(idx)
+        except (OSError, ValueError) as exc:
+            idx, img = self._replace_unreadable(idx, exc)
         target = self._get_label(idx)
         copied = {}
         for key, value in target.items():
             copied[key] = value.copy() if isinstance(value, np.ndarray) else value
         return img, copied
+
+    def _replace_unreadable(self, idx, exc):
+        """Train on another image when one cannot be decoded, instead of ending the run.
+
+        Validation and the strict policy still fail: a metric over a swapped
+        image would be wrong, and "error" promises a loud stop.
+        """
+        path = self.img_files[idx]
+        if not self.augment or self.annotation_audit.policy == "error":
+            raise FileNotFoundError(f"Failed to read image: {path} ({exc})") from exc
+        bad = self.__dict__.setdefault("_unreadable", set())
+        if path not in bad:
+            bad.add(path)
+            self.annotation_audit.issue("unreadable_image", path, detail=str(exc), fatal=False)
+            warnings.warn(f"Unreadable image, training on another in its place: {path}", RuntimeWarning, stacklevel=3)
+        for step in range(1, len(self.img_files)):
+            other = (idx + step) % len(self.img_files)
+            if self.img_files[other] in bad:
+                continue
+            try:
+                return other, self._get_cached_image(other)
+            except (OSError, ValueError) as other_exc:
+                bad.add(self.img_files[other])
+                self.annotation_audit.issue("unreadable_image", self.img_files[other], detail=str(other_exc), fatal=False)
+        raise FileNotFoundError(f"No readable images left in the dataset (last: {path})") from exc
 
     def set_epoch(self, epoch):
         self.epoch = epoch

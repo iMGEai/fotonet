@@ -61,7 +61,7 @@ def _require_pycocotools():
         from pycocotools.cocoeval import COCOeval
     except ImportError as exc:
         raise RuntimeError(
-            "FOTONET validation requires official pycocotools COCOeval. Install pycocotools before validating."
+            "fotonet validation requires official pycocotools COCOeval. Install pycocotools before validating."
         ) from exc
     return COCO, COCOeval
 
@@ -278,7 +278,7 @@ class CocoMapEvaluator:
             raise ValueError("gt_iscrowd and gt_ignore must align with gt_boxes")
 
         dataset = {
-            "info": {"description": "FOTONET immutable validation ground truth"},
+            "info": {"description": "fotonet immutable validation ground truth"},
             "licenses": [],
             "images": [
                 {"id": image_id, "width": width, "height": height}

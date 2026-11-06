@@ -15,6 +15,8 @@
 | `fotonetl` | v1.1 (UltraDense) | 70.32M | 161.51 GFLOPs | Architecture in package, weights coming soon |
 | `fotonete` | v1 | 1.70M | 5.20 GFLOPs | Available |
 
+`fotonetn` now loads weights retrained with the 1.2 trainer: 32.1 mAP50-95 on COCO val2017, up from 29.9, with the same model, size and speed. The first weights stay in the release as `fotonetn-ex.pt`. See [published weights](docs/model-zoo.md#published-weights) and [trainer 1.2](docs/training.md#trainer-12).
+
 ## Install
 
 ```bash

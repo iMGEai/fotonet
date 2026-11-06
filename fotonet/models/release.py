@@ -6,7 +6,7 @@ Weight generations
 ``fotonete2`` -> generation 2 -> release ``v2``
 ``fotonet3``  -> ...          -> release ``v<generation>``
 
-``fotonetn`` (the v1.1 family) lives in the ``v1.1`` release.
+``fotonetn`` (the v1.1 family) lives in the ``v1.1`` release (``resolve_v11_release``).
 
 Every generation is one graph with different trained weights, and each lives in
 its own ``v<generation>`` release. The package version on PyPI is unrelated
@@ -161,11 +161,16 @@ def resolve_release_checkpoint(model_ref: str = "fotonete") -> Path:
     return cached
 
 # ---------------------------------------------------------------- v1.1 family
-# A v1.1 model's weights are the asset ``<model_id>.pt`` in the ``v1.1``
-# release (``fotonetn.pt`` today). A model with no published asset resolves to
-# None and the caller warns that it is untrained.
+# A v1.1-family model's weights are the asset ``<model_id>.pt`` in the ``v1.1``
+# release. Newer weights for the same graph are re-published there under the
+# same name (fotonetn retrained with the 1.2 trainer replaced the first fotonetn,
+# which stays in that release as ``fotonetn-ex.pt``). A cached file is checked
+# against the release's ETag at most once a day, so a re-published asset reaches
+# installed copies without a package release. A model with no published asset
+# resolves to None and the caller warns that it is untrained.
 V11_RELEASE_TAG = "v1.1"
 MISSING_TTL_SECONDS = 24 * 3600
+RECHECK_SECONDS = 24 * 3600
 
 
 def _offline():
@@ -176,35 +181,77 @@ def v11_release_url(model_id: str) -> str:
     return f"{RELEASE_HOST}/{V11_RELEASE_TAG}/{model_id}.pt"
 
 
-def resolve_v11_release(model_id: str):
-    """Path to published v1.1 weights for ``model_id``, or None when there are none.
+def v11_cache_path(model_id: str) -> Path:
+    """Where the weights for ``model_id`` are cached: the path fotonet 1.1 used."""
+    return _cache_dir() / f"{model_id}.pt"
 
-    A cached file wins. A recent "not published" answer is remembered for a
-    day so constructing models offline or before a release never stalls.
-    ``FOTONET_OFFLINE=1`` skips the network entirely.
-    """
-    import time
 
-    model_id = str(model_id).strip().lower()
-    cached = _cache_dir() / f"{model_id}.pt"
-    if cached.is_file():
-        return cached
-    url = v11_release_url(model_id)
-    marker = cached.with_suffix(".pt.missing")
-    if marker.is_file() and time.time() - marker.stat().st_mtime < MISSING_TTL_SECONDS:
-        try:
-            # A miss only counts for the URL it was recorded against.
-            if marker.read_text(encoding="utf-8").strip() == url:
-                return None
-        except OSError:
-            pass
-    if _offline():
-        return None
+def _head(url: str):
+    """``(True, etag)`` when ``url`` exists, ``(False, None)`` when it does not or cannot be reached."""
     try:
         request = Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
         with urlopen(request, timeout=5) as response:
-            etag = response.headers.get("ETag") or response.headers.get("Last-Modified")
+            return True, response.headers.get("ETag") or response.headers.get("Last-Modified")
     except (HTTPError, URLError, OSError, ValueError):
+        return False, None
+
+
+def _fresh(path: Path, ttl: float) -> bool:
+    import time
+
+    try:
+        return time.time() - path.stat().st_mtime < ttl
+    except OSError:
+        return False
+
+
+def _recent_miss(marker: Path, url: str) -> bool:
+    if not _fresh(marker, MISSING_TTL_SECONDS):
+        return False
+    try:
+        # A miss only counts for the URL it was recorded against.
+        return marker.read_text(encoding="utf-8").strip() == url
+    except OSError:
+        return False
+
+
+def _revalidate(cached: Path, url: str) -> None:
+    """Replace ``cached`` when the release's asset changed; keep it when the host cannot be reached."""
+    meta_path = cached.with_suffix(CACHE_META_SUFFIX)
+    if _fresh(meta_path, RECHECK_SECONDS):
+        return
+    found, etag = _head(url)
+    if not found or not etag:
+        return  # unreachable or unpublished: the cached file stays in use
+    if etag != _read_meta(cached).get("etag"):
+        try:
+            _download(url, cached)
+        except RuntimeError:
+            return  # a failed refresh never breaks a working cache
+    _write_meta(cached, url, etag)  # also restarts the once-a-day clock
+
+
+def resolve_v11_release(model_id: str):
+    """Path to the published weights for ``model_id``, or None when there are none.
+
+    A cached file is used, after an ETag check at most once a day. A recent "not
+    published" answer is remembered for a day so constructing models offline or
+    before a release never stalls. ``FOTONET_OFFLINE=1`` skips the network.
+    """
+    model_id = str(model_id).strip().lower()
+    cached = v11_cache_path(model_id)
+    url = v11_release_url(model_id)
+    if cached.is_file():
+        if not _offline():
+            _revalidate(cached, url)
+        return cached
+    if _offline():
+        return None
+    marker = cached.with_suffix(".pt.missing")
+    if _recent_miss(marker, url):
+        return None
+    found, etag = _head(url)
+    if not found:
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(url, encoding="utf-8")
