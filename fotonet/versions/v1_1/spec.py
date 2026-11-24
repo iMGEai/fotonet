@@ -23,6 +23,10 @@ import json
 
 
 V11_MODEL_IDS = ("fotonetn", "fotonets", "fotonetm", "fotonetl")
+# Alpha layouts: same graph code and parts, a layout under test. Never in a release asset; a
+# released id above never changes. fotonetnr is fotonets at half width (docs/internal/layer-reallocation.md).
+V11_ALPHA_IDS = ("fotonetnr",)
+_ALL_MODEL_IDS = V11_MODEL_IDS + V11_ALPHA_IDS
 LEVEL_STRIDES = {3: 8, 4: 16, 5: 32}
 
 FINGERPRINT_KEYS = (
@@ -62,9 +66,9 @@ class V11Spec:
     imgsz: int = 640
 
     def __post_init__(self) -> None:
-        if self.model_id not in V11_MODEL_IDS:
+        if self.model_id not in _ALL_MODEL_IDS:
             raise ValueError(
-                f"Unknown v1.1 model id {self.model_id!r}; expected one of {V11_MODEL_IDS}."
+                f"Unknown v1.1 model id {self.model_id!r}; expected one of {_ALL_MODEL_IDS}."
             )
         validate_layout(
             stem_channels=self.stem_channels, p2_channels=self.p2_channels, widths=self.widths,
@@ -108,7 +112,7 @@ def _load_family() -> dict[str, V11Spec]:
     from fotonet.config.model_recipes import load_model_recipe
 
     family = {}
-    for model_id in V11_MODEL_IDS:
+    for model_id in _ALL_MODEL_IDS:
         recipe = load_model_recipe(model_id, generation="v1.1")
         if recipe.get("model_id") != model_id or str(recipe.get("graph_version")) != GRAPH_VERSION:
             raise ValueError(f"model recipe for {model_id} does not match v1.1 graph {GRAPH_VERSION}.")
@@ -180,6 +184,7 @@ __all__ = [
     "FAMILY",
     "GRAPH_VERSION",
     "V11_MODEL_IDS",
+    "V11_ALPHA_IDS",
     "LEVEL_STRIDES",
     "FINGERPRINT_KEYS",
     "get_spec",

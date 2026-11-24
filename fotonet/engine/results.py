@@ -173,6 +173,34 @@ class BoxTransform:
         return tuple(float(v) for v in self._xyxy())
 
     @property
+    def xywhn(self):
+        return self.xywh
+
+    @property
+    def xyxyn(self):
+        return self.xyxy
+
+    @property
+    def pixel_xywh(self):
+        x, y, w, h = self.xywh
+        return (
+            float(x * self._image_w),
+            float(y * self._image_h),
+            float(w * self._image_w),
+            float(h * self._image_h),
+        )
+
+    @property
+    def pixel_xyxy(self):
+        x1, y1, x2, y2 = self.xyxy
+        return (
+            float(x1 * self._image_w),
+            float(y1 * self._image_h),
+            float(x2 * self._image_w),
+            float(y2 * self._image_h),
+        )
+
+    @property
     def position(self):
         x, y = _anchor_position_xyxy(self._xyxy(), self.anchor)
         return Vector2(float(x), float(y))
@@ -367,7 +395,12 @@ class BoxTransform:
         return self.iou(other) > 0.0
 
     def iou(self, other):
-        other_xyxy = other.xyxy if hasattr(other, "xyxy") else other.transform.xyxy
+        if hasattr(other, "xyxyn"):
+            other_xyxy = other.xyxyn
+        elif hasattr(other, "xyxy"):
+            other_xyxy = other.xyxy
+        else:
+            other_xyxy = other.transform.xyxy
         x1, y1, x2, y2 = self._xyxy()
         ox1, oy1, ox2, oy2 = other_xyxy
         inter = max(0.0, min(x2, ox2) - max(x1, ox1)) * max(0.0, min(y2, oy2) - max(y1, oy1))
@@ -403,7 +436,12 @@ class BoxTransform:
 
 
 class DetectionBox:
-    """One detection. ``cls`` is the class *name*; ``cls_id`` and ``label`` are explicit.
+    """One detection.
+
+    ``xyxy`` and ``xywh`` are image-pixel tuples matching :class:`DetectionBoxes`;
+    ``xyxyn`` and ``xywhn`` are normalized ``0..1`` coordinates. ``cls`` (and
+    ``name`` / ``label``) is the class name; ``cls_id`` is the integer class id;
+    ``id`` aliases ``track_id``.
 
     Values come from one host copy per result, so iterating detections of a CUDA
     result costs a single device transfer instead of several per box.
@@ -417,13 +455,13 @@ class DetectionBox:
         self.cls_id = int(classes[self.idx])
         self.cls = parent.names.get(self.cls_id, str(self.cls_id))
         self.track_id = None if track_ids is None else int(track_ids[self.idx])
-        self.xywh = tuple(float(v) for v in boxes[self.idx])
+        self._xywhn = tuple(float(v) for v in boxes[self.idx])
         self._transform = None
 
     @property
     def transform(self):
         if self._transform is None:
-            self._transform = BoxTransform(self.xywh, self._parent.image_size)
+            self._transform = BoxTransform(self._xywhn, self._parent.image_size)
         return self._transform
 
     @transform.setter
@@ -431,14 +469,28 @@ class DetectionBox:
         self._transform = value
 
     @property
+    def id(self):
+        return self.track_id
+
+    @property
     def label(self):
         return self.cls
 
     @property
-    def xyxy(self):
+    def name(self):
+        return self.cls
+
+    @property
+    def xywhn(self):
+        if self._transform is not None:
+            return self._transform.xywh
+        return self._xywhn
+
+    @property
+    def xyxyn(self):
         if self._transform is not None:
             return self._transform.xyxy
-        x, y, w, h = self.xywh
+        x, y, w, h = self._xywhn
         hw, hh = w * 0.5, h * 0.5
         return (
             float(np.float32(x - hw)),
@@ -446,6 +498,22 @@ class DetectionBox:
             float(np.float32(x + hw)),
             float(np.float32(y + hh)),
         )
+
+    @property
+    def xywh(self):
+        if self._transform is not None:
+            return self._transform.pixel_xywh
+        x, y, w, h = self._xywhn
+        img_w, img_h = self._parent.image_size
+        return (float(x * img_w), float(y * img_h), float(w * img_w), float(h * img_h))
+
+    @property
+    def xyxy(self):
+        if self._transform is not None:
+            return self._transform.pixel_xyxy
+        x1, y1, x2, y2 = self.xyxyn
+        img_w, img_h = self._parent.image_size
+        return (float(x1 * img_w), float(y1 * img_h), float(x2 * img_w), float(y2 * img_h))
 
 
 class DetectionBoxes:
@@ -707,7 +775,7 @@ class Results:
         else:
             try:
                 import cv2
-                cv2.imshow("FOTO-NET Detection", cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR))
+                cv2.imshow("fotonet Detection", cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR))
                 cv2.waitKey(0)
                 cv2.destroyAllWindows()
             except ImportError:

@@ -160,15 +160,17 @@ def resolve_release_checkpoint(model_ref: str = "fotonete") -> Path:
     _write_meta(cached, url, etag)
     return cached
 
-# ---------------------------------------------------------------- v1.1 family
+# ---------------------------------------------------------------- v1.1 / v2 families
 # A v1.1-family model's weights are the asset ``<model_id>.pt`` in the ``v1.1``
-# release. Newer weights for the same graph are re-published there under the
-# same name (fotonetn retrained with the 1.2 trainer replaced the first fotonetn,
-# which stays in that release as ``fotonetn-ex.pt``). A cached file is checked
-# against the release's ETag at most once a day, so a re-published asset reaches
-# installed copies without a package release. A model with no published asset
-# resolves to None and the caller warns that it is untrained.
+# release; a v2-family model's weights are ``<model_id>.pt`` in the ``v2``
+# release (for example ``fotonet2n.pt``). Newer weights for the same graph are
+# re-published under the same name (fotonetn retrained with the 1.2 trainer
+# replaced the first fotonetn, which stays in ``v1.1`` as ``fotonetn-ex.pt``).
+# A cached file is checked against the release's ETag at most once a day, so a
+# re-published asset reaches installed copies without a package release. A model
+# with no published asset resolves to None and the caller warns that it is untrained.
 V11_RELEASE_TAG = "v1.1"
+V2_RELEASE_TAG = "v2"
 MISSING_TTL_SECONDS = 24 * 3600
 RECHECK_SECONDS = 24 * 3600
 
@@ -183,6 +185,15 @@ def v11_release_url(model_id: str) -> str:
 
 def v11_cache_path(model_id: str) -> Path:
     """Where the weights for ``model_id`` are cached: the path fotonet 1.1 used."""
+    return _cache_dir() / f"{model_id}.pt"
+
+
+def v2_release_url(model_id: str) -> str:
+    return f"{RELEASE_HOST}/{V2_RELEASE_TAG}/{model_id}.pt"
+
+
+def v2_cache_path(model_id: str) -> Path:
+    """Where published v2 weights for ``model_id`` are cached locally."""
     return _cache_dir() / f"{model_id}.pt"
 
 
@@ -231,16 +242,8 @@ def _revalidate(cached: Path, url: str) -> None:
     _write_meta(cached, url, etag)  # also restarts the once-a-day clock
 
 
-def resolve_v11_release(model_id: str):
-    """Path to the published weights for ``model_id``, or None when there are none.
-
-    A cached file is used, after an ETag check at most once a day. A recent "not
-    published" answer is remembered for a day so constructing models offline or
-    before a release never stalls. ``FOTONET_OFFLINE=1`` skips the network.
-    """
-    model_id = str(model_id).strip().lower()
-    cached = v11_cache_path(model_id)
-    url = v11_release_url(model_id)
+def _resolve_family_release(model_id: str, url: str, cached: Path):
+    """Resolve a floating ``<model_id>.pt`` asset with daily ETag revalidation and miss caching."""
     if cached.is_file():
         if not _offline():
             _revalidate(cached, url)
@@ -261,3 +264,24 @@ def resolve_v11_release(model_id: str):
     _download(url, cached)
     _write_meta(cached, url, etag)
     return cached
+
+
+def resolve_v11_release(model_id: str):
+    """Path to the published v1.1 weights for ``model_id``, or None when there are none.
+
+    A cached file is used, after an ETag check at most once a day. A recent "not
+    published" answer is remembered for a day so constructing models offline or
+    before a release never stalls. ``FOTONET_OFFLINE=1`` skips the network.
+    """
+    model_id = str(model_id).strip().lower()
+    return _resolve_family_release(model_id, v11_release_url(model_id), v11_cache_path(model_id))
+
+
+def resolve_v2_release(model_id: str):
+    """Path to the published v2 weights for ``model_id`` (from the ``v2`` release), or None.
+
+    Uses the same local cache, once-a-day ETag refresh, 24 h miss cache, and
+    ``FOTONET_OFFLINE=1`` contract as :func:`resolve_v11_release`.
+    """
+    model_id = str(model_id).strip().lower()
+    return _resolve_family_release(model_id, v2_release_url(model_id), v2_cache_path(model_id))

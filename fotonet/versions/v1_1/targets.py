@@ -47,7 +47,10 @@ YOLO26_E2E_MAP = {"n": 40.1, "s": 47.8, "m": 52.5, "l": 54.4}
 # calibrate our counter against the published counting rule.
 YOLO26N_MEASURED = {"params": 2_408_932, "gflops_thop": 5.36}
 
-TIER_OF = {"fotonetn": "n", "fotonets": "s", "fotonetm": "m", "fotonetl": "l"}
+TIER_OF = {
+    "fotonetn": "n", "fotonets": "s", "fotonetm": "m", "fotonetl": "l", "fotonetnr": "n",
+    "fotonet2n": "n",
+}
 
 
 def gate(tier, peers=YOLO27, margin=MARGIN):

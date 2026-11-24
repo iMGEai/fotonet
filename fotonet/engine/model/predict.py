@@ -155,10 +155,19 @@ class PredictMixin:
 
             known = ["source", "imgsz", "conf", "max_det", "device", "batch", "stream", "retain_images",
                      "classes", "vid_stride", "save", "save_txt", "project", "name", "exist_ok"]
+            migration_hints = {
+                "iou": "fotonet is NMS-free and has no IoU/NMS threshold; tune conf instead",
+                "agnostic_nms": "fotonet is NMS-free and has no IoU/NMS threshold; tune conf instead",
+                "save_dir": "use project= and name= for predict output folders",
+                "half": "call model.prepare_for_inference(half=True) once before predict()",
+            }
             hints = []
             for key in sorted(kwargs):
-                close = difflib.get_close_matches(key, known, n=1)
-                hints.append(key + (f" (did you mean '{close[0]}'?)" if close else ""))
+                if key in migration_hints:
+                    hints.append(f"{key} ({migration_hints[key]})")
+                else:
+                    close = difflib.get_close_matches(key, known, n=1)
+                    hints.append(key + (f" (did you mean '{close[0]}'?)" if close else ""))
             raise TypeError(f"Unsupported predict option(s): {', '.join(hints)}")
         class_mask = self._class_mask(classes)
         saver = self._result_saver(save, save_txt, project, name, exist_ok)
@@ -311,23 +320,48 @@ class PredictMixin:
             retain_images=retain_images,
         )
 
-    def predict_bgr(self, source, imgsz=None, conf=0.25, max_det=300, device=None,
-                    batch=16, retain_images=True):
+    def predict_bgr(
+        self,
+        source,
+        imgsz=None,
+        conf=0.25,
+        max_det=300,
+        device=None,
+        batch=16,
+        retain_images=True,
+        classes=None,
+        save=False,
+        save_txt=False,
+        project=None,
+        name=None,
+        exist_ok=False,
+    ):
         """Run RGB-model inference from BGR OpenCV frames and return a list of Results."""
+        if save and retain_images is False:
+            raise ValueError("save=True needs the pixels; do not combine it with retain_images=False.")
+        class_mask = self._class_mask(classes)
+        saver = self._result_saver(save, save_txt, project, name, exist_ok)
         target_h, target_w = self._resolve_predict_imgsz(imgsz)
         prepared = self._prepare_predict_model(device)
         device = torch.device(device or self.device)
         batch = max(int(batch or 1), 1)
         sources = list(source) if isinstance(source, (list, tuple)) else [source]
         results = []
-        for start in range(0, len(sources), batch):
-            results.extend(
-                self._predict_batch_impl(
+        previous = self.__dict__.get("_active_class_mask")
+        self._active_class_mask = class_mask
+        try:
+            for start in range(0, len(sources), batch):
+                batch_results = self._predict_batch_impl(
                     sources[start:start + batch], (target_h, target_w), conf, device=device,
                     bgr=True, max_det=max_det, retain_images=bool(retain_images),
                     prepared=prepared,
                 )
-            )
+                if saver is not None:
+                    for offset, result in enumerate(batch_results):
+                        saver(result, start + offset)
+                results.extend(batch_results)
+        finally:
+            self._active_class_mask = previous
         return results
 
     def _predict_batch_impl(self, sources, imgsz, conf=0.25, device=None, bgr=False,

@@ -1,0 +1,125 @@
+# FOTONET v1.3 scratch recipe: fotonetn, trained with the v1.3 trainer (docs/internal/fotonetn_revision_plan.md).
+# Same model as fotonetn_scratch_v12; only training differs. Not yet run at full scale: each lever below
+# carries the plan's test before a full run.
+#
+# What changes against fotonetn_scratch_v12:
+#   - Schedule: WSS, 500 epochs. 5 warmup, stable at 1e-3 to epoch 250, cosine to 4e-4 at epoch 300,
+#     stable to epoch 400, cosine to 1e-5 at epoch 500. The last 10 epochs of the 1.2 run sat flat at
+#     1e-5, so the final cosine spends fewer epochs near the bottom.
+#   - Mosaic off for the last 60 epochs, inside the second cosine.
+#   - Self-distillation: from epoch 200 the deployed head's positives also learn from the training head.
+#   - Nine-image mosaics on 30% of mosaics over the middle of the run: more objects per image.
+#   - Training head the same width as the deployed head (o2m_mult 1.0).
+#   - Scale jitter floor up (zoom 0.5-1.5): fewer objects shrink below a few pixels.
+#   - The mean of the last 10 EMA snapshots is written next to the best checkpoint.
+#   - Validation on the fused graph with a larger batch.
+
+model: fotonetn
+pretrained: false
+resume: false
+trainer: "1.3"
+
+train:
+  epochs: 500
+  imgsz: 640
+  # 512 px for epochs 1-30, 576 px for 31-60, 640 px from 61 on.
+  imgsz_schedule:
+    - [0.06, 512]
+    - [0.06, 576]
+    - [0.88, 640]
+  nbs: 128
+  batch: 16
+  workers: 4
+  predecode: false
+  predecode_dir: null
+  predecode_max_side: 720
+  close_mosaic: 60
+  mosaic_dense: 0.3
+  mosaic_dense_from: 0.3
+  mosaic_dense_to: 0.8
+  out_dir: runs/train
+  lr_scheduler: wss
+  wss_stable_end: 250
+  wss_decay_end: 300
+  wss_settle_end: 400
+  wss_settle: 0.4
+  grad_clip: 10.0
+  val_period: 5
+  val_final_epochs: 50
+  val_batch: 32
+  val_workers: 4
+  val_fused: true
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 5.0
+  forecast: true
+  o2m_mult: 1.0
+  o2o_groups: 1
+  ema_average_last: 10
+  ema_average_every: 4
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 5
+  ema_decay: 0.99985
+  ema_tau: 2000
+
+augment:
+  mosaic: 0.90
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.5
+  fliplr: 0.606
+  flipud: 0.0
+  degrees: 1.11
+  shear: 1.46
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.106
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  quality_start_epoch: 3
+  quality_warmup_epochs: 8
+  center_prior_epochs: 6
+  o2o_prior_epochs: 6
+  o2o_cls: bce
+  o2o_q_gamma: 1.0
+  w_runner_up: 1.5
+  o2o_neg_alpha: 1.0
+  o2o_neg_gamma: 1.0
+  o2o_distill: 0.0
+
+knob_schedule:
+  - {epoch: 200, o2o_distill: 0.5}
+
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  o2o_metric: consistent
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+  o2m_target: iou
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

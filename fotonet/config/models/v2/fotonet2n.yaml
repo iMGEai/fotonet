@@ -1,0 +1,34 @@
+# fotonet2n (fotonet v2 Hi Bird): end-to-end NMS-free nano object detector.
+# CNN + Area-Attention (R-ELAN) + HyperACE/FullPAD-Lite + Hybrid-TopK 2-layer GeoSA Query Refinement.
+# Deployed at 640 (fused, O2M-C and CDN stripped): ~2.70M params, ~6.7-6.9 GFLOPs, single-pass [B, 300, nc+4].
+model_id: fotonet2n
+generation: v2
+graph_version: 2.0-alpha
+layout:
+  stem_channels: 16
+  p2_channels: 32
+  # [out_width, hidden_width, n_conv, e_conv] for stages s4, s8, s16, s32
+  stages: [[64, 16, 1, 0.75], [128, 36, 2, 0.67], [160, 64, 1, 0.5], [256, 96, 2, 0.5]]
+  # [n_attn, area] per backbone stage: P4 uses 2x AreaAttn(area=4), P5 uses 2x GlobalAttn(area=1)
+  stage_attn: [[0, 1], [0, 1], [2, 4], [2, 1]]
+  # HyperACE cross-scale linear hypergraph at 40x40: [hidden, num_edges]
+  hyper_ace: [64, 24]
+  # Neck PAN junctions: td4, td3, bu4, bu5 (bu5 includes 1x GlobalAttn when neck_attention=true)
+  junctions: [[128, 64, 1, 0.5], [72, 36, 1, 0.5], [128, 64, 1, 0.5], [192, 64, 1, 0.5]]
+  # Stage-0 dense proposal head widths [reg_width, cls_width]
+  head_hidden: [28, 72]
+  neck_attention: true
+  neck_down: [rep, rep]
+  taps: false
+  # Stage-1 GeoSA sparse query refinement decoder
+  decoder_dim: 128
+  decoder_layers: 2
+  decoder_queries: 300
+  # Context re-sampling mode: "edge_sample" (4-edge bilinear) or "hyper_xattn" (zero-GridSample pure GEMM)
+  decoder_context: edge_sample
+  mlp_ratio: 1.5
+parts:
+  backbone: backbone.v2@2.0.0
+  neck: neck.v2@2.0.0
+  head: head.v2@2.0.0
+  blocks: [nn.conv@2, nn.repconv@2, nn.sppf@2, nn.rep_bottleneck@2, nn.area_attention@2.0.0, nn.relan@2.0.0, nn.hyper_ace@2.0.0, nn.geosa@2.0.0]

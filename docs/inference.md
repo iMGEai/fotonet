@@ -32,7 +32,8 @@ input. Video/webcam calls return an iterator only with `stream=True`.
 ```python
 for detection in result.boxes:
     print(detection.cls_id, detection.cls, detection.conf)
-    print(detection.xywh, detection.xyxy)
+    print(detection.xywh, detection.xyxy)    # pixel coordinates
+    print(detection.xywhn, detection.xyxyn)  # normalized 0..1 coordinates
 
 result.save("prediction.jpg")
 json_text = result.to_json()

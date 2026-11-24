@@ -22,14 +22,22 @@ y shear are drawn independently.
 from __future__ import annotations
 
 import math
+import random
 
 import torch
 import torch.nn.functional as F
 
 
 def _augment_core(imgs_u8, boxes_pad, valid, cos, sin, scale, shear, tx, ty,
-                  hsv_gains, mh, mv, mb, po, H, W):
-    """Deterministic, shape-static augmentation core (compiled)."""
+                  hsv_gains, mh, mv, mb, po, H, W, channels_last=False, out_dtype=torch.float32):
+    """Deterministic, shape-static augmentation core (compiled).
+
+    Written so the compiler can produce the image in one pass: the flips are applied to the
+    sampling grid instead of to the finished image, the channel max and min are elementwise, and
+    the channel swap and the division by 255 happen where the output is written. ``channels_last``
+    and ``out_dtype`` choose the layout and type of that output; a bfloat16 output holds the
+    values autocast would make of the float32 one at the model's first convolution.
+    """
     B = imgs_u8.shape[0]
     ones = torch.ones_like(cos)
     rs = torch.stack([cos * scale, -sin * scale,
@@ -62,9 +70,12 @@ def _augment_core(imgs_u8, boxes_pad, valid, cos, sin, scale, shear, tx, ty,
     gx = (2.0 * (pi[..., 0] + 1.0) + 1.0) / (W + 2) - 1.0
     gy = (2.0 * (pi[..., 1] + 1.0) + 1.0) / (H + 2) - 1.0
     grid = torch.stack((gx, gy), -1).view(B, H, W, 2)
+    # Flipping the image after the warp equals sampling it through the flipped grid (the same
+    # numbers land at the mirrored pixel), and needs no second pass over the image.
+    grid = torch.where(mh.view(B, 1, 1, 1), grid.flip(2), grid)
+    grid = torch.where(mv.view(B, 1, 1, 1), grid.flip(1), grid)
     warped = F.grid_sample(xp, grid, mode="bilinear",
                            padding_mode="border", align_corners=False)
-    x = warped
 
     # ---- boxes through the FORWARD matrices ----
     cx, cy = boxes_pad[..., 0] * W, boxes_pad[..., 1] * H
@@ -94,9 +105,9 @@ def _augment_core(imgs_u8, boxes_pad, valid, cos, sin, scale, shear, tx, ty,
     ], -1)
 
     # ---- HSV jitter (per-sample gains, fused) ----
-    r, g, b = x[:, 0], x[:, 1], x[:, 2]
-    maxc = x.max(1).values
-    minc = x.min(1).values
+    r, g, b = warped[:, 0], warped[:, 1], warped[:, 2]
+    maxc = torch.maximum(torch.maximum(r, g), b)
+    minc = torch.minimum(torch.minimum(r, g), b)
     v = maxc
     delta = maxc - minc + 1e-6
     s = delta / (maxc + 1e-6)
@@ -125,35 +136,37 @@ def _augment_core(imgs_u8, boxes_pad, valid, cos, sin, scale, shear, tx, ty,
     b = torch.where(sext == 0, p, torch.where(sext == 1, p,
         torch.where(sext == 2, tcol, torch.where(sext == 3, v,
         torch.where(sext == 4, v, q)))))
-    x = torch.stack((r, g, b), 1)
 
-    # ---- flips + BGR swap (branch-free, full-batch where) ----
-    if4 = lambda m: m.view(B, 1, 1, 1)
-    x = torch.where(if4(mh), x.flip(-1), x)
+    # ---- flips (the image was flipped through its grid) + BGR swap, branch-free ----
     boxes_out = torch.where(
         mh.view(B, 1, 1),
         torch.stack((1.0 - boxes_out[..., 0], boxes_out[..., 1],
                      boxes_out[..., 2], boxes_out[..., 3]), -1),
         boxes_out)
-    x = torch.where(if4(mv), x.flip(-2), x)
     boxes_out = torch.where(
         mv.view(B, 1, 1),
         torch.stack((boxes_out[..., 0], 1.0 - boxes_out[..., 1],
                      boxes_out[..., 2], boxes_out[..., 3]), -1),
         boxes_out)
-    if3 = mb.view(B, 1, 1, 1)
-    x = torch.where(if3, x[:, [2, 1, 0]], x)
-
-    x = x.div(255.0)
+    swap = mb.view(B, 1, 1)
+    channels = (torch.where(swap, b, r), g, torch.where(swap, r, b))
+    if channels_last:
+        x = torch.stack(channels, -1).div(255.0).permute(0, 3, 1, 2)
+    else:
+        x = torch.stack(channels, 1).div(255.0)
     boxes_out = boxes_out.clamp(0.0, 1.0)
-    return x, boxes_out, keep
+    return x.to(out_dtype), boxes_out, keep
 
 
 class GpuAugmenter:
     """Stateful batch augmenter matching the v1 recipe knobs."""
 
-    def __init__(self, hyp, device, imgsz=640, mmax=48, compile_core=True):
+    def __init__(self, hyp, device, imgsz=640, mmax=48, compile_core=True, channels_last=False,
+                 out_dtype=torch.float32):
         self.hyp = dict(hyp)
+        # Layout and type of the output images (see _augment_core).
+        self.channels_last = bool(channels_last)
+        self.out_dtype = out_dtype
         self.device = torch.device(device)
         self.imgsz = int(imgsz)
         self.mmax = int(mmax)
@@ -214,7 +227,7 @@ class GpuAugmenter:
         targets = list of B dicts with 'boxes'/'labels'; labels_pad may be
         pre-supplied by the trainer.
 
-        Returns (x [B,3,H,W] float in [0,1], boxes [B,mmax,4] xywh-norm,
+        Returns (x [B,3,H,W] in [0,1] (out_dtype, channels-last if asked), boxes [B,mmax,4] xywh-norm,
         labels [B,mmax] long, valid [B,mmax] bool) — all on device.
         """
         dev = self.device
@@ -293,7 +306,7 @@ class GpuAugmenter:
         H, W = imgs_u8.shape[-2], imgs_u8.shape[-1]
         po = self._pixel_grid(H, W)
         args = (imgs_u8, boxes_pad, valid, torch.cos(angle), torch.sin(angle),
-                scale, shear, tx, ty, hsv_gains, mh, mv, mb, po, H, W)
+                scale, shear, tx, ty, hsv_gains, mh, mv, mb, po, H, W, self.channels_last, self.out_dtype)
         try:
             x, boxes_out, keep = self._core(*args)
         except Exception as exc:
@@ -305,7 +318,173 @@ class GpuAugmenter:
             self._compiled = False
             self._core = _augment_core
             x, boxes_out, keep = self._core(*args)
+
+        cp_prob = float(hyp.get("copy_paste", 0.0))
+        if cp_prob > 0.0 and B > 1:
+            x, boxes_out, labels_pad, keep = gpu_batch_copy_paste(
+                x, boxes_out, labels_pad, keep,
+                prob=cp_prob,
+                max_boxes=M,
+                generator=gen,
+            )
+
+        mixup_prob = float(hyp.get("mixup", 0.0))
+        if mixup_prob > 0.0 and B > 1 and random.random() < mixup_prob:
+            x, boxes_out, labels_pad, keep, _ = gpu_batch_mixup(
+                x, boxes_out, labels_pad, keep,
+                alpha=float(hyp.get("mixup_alpha", 32.0)),
+                max_boxes=M,
+            )
         return x, boxes_out, labels_pad, keep
 
 
-__all__ = ["GpuAugmenter"]
+def gpu_batch_mixup(images: torch.Tensor, boxes: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor,
+                     alpha: float = 32.0, max_boxes: int | None = None):
+    """Tensor-level GPU batch MixUp without CPU host roundtrips.
+
+    images   [B, C, H, W] in [0, 1] (or uint8)
+    boxes    [B, M, 4] normalized cxcywh
+    labels   [B, M] class ids
+    valid    [B, M] bool mask of valid boxes
+    alpha    Beta distribution concentration parameter
+    max_boxes optional maximum box count to keep (pads or truncates to max_boxes)
+
+    Returns ``(images_mix, boxes_mix, labels_mix, valid_mix, weights_mix)``.
+    """
+    B = images.shape[0]
+    if B <= 1:
+        w_dtype = images.dtype if images.is_floating_point() else torch.float32
+        ones_w = valid.to(w_dtype)
+        return images, boxes, labels, valid, ones_w
+
+    perm = torch.randperm(B, device=images.device)
+    a = float(alpha)
+    if a > 0:
+        a_clamped = min(a, 1e4)
+        lam = float(random.betavariate(a_clamped, a_clamped))
+    else:
+        lam = 0.5
+
+    # Blend while preserving channels_last memory format if active
+    is_cl = images.ndim == 4 and images.is_contiguous(memory_format=torch.channels_last)
+    partner = images[perm]
+    if is_cl and not partner.is_contiguous(memory_format=torch.channels_last):
+        partner = partner.contiguous(memory_format=torch.channels_last)
+    if images.is_floating_point():
+        images_mix = torch.lerp(partner, images, lam)
+    else:
+        images_mix = torch.lerp(partner.float(), images.float(), lam).to(images.dtype)
+
+    boxes_mix = torch.cat([boxes, boxes[perm]], dim=1)
+    labels_mix = torch.cat([labels, labels[perm]], dim=1)
+    valid_mix = torch.cat([valid, valid[perm]], dim=1)
+    w_dtype = images.dtype if images.is_floating_point() else torch.float32
+    weights_mix = torch.cat([lam * valid.to(w_dtype), (1.0 - lam) * valid[perm].to(w_dtype)], dim=1)
+
+    if max_boxes is not None and boxes_mix.shape[1] > max_boxes:
+        order = valid_mix.to(torch.uint8).argsort(dim=1, descending=True, stable=True)[:, :max_boxes]
+        boxes_mix = boxes_mix.gather(1, order[..., None].expand(-1, -1, 4))
+        labels_mix = labels_mix.gather(1, order)
+        valid_mix = valid_mix.gather(1, order)
+        weights_mix = weights_mix.gather(1, order)
+
+    return images_mix, boxes_mix, labels_mix, valid_mix, weights_mix
+
+
+def gpu_batch_copy_paste(images: torch.Tensor, boxes: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor,
+                         prob: float = 0.15, max_paste: int = 3, max_area: float = 0.25,
+                         max_overlap: float = 0.10, max_boxes: int | None = None,
+                         generator: torch.Generator | None = None):
+    """Zero-host-sync tensor-level GPU Box Copy-Paste.
+
+    For each triggered image ``b`` in the batch, selects up to ``max_paste`` small/medium non-crowd
+    objects from a distinct partner image ``perm[b]`` whose bounding boxes do not overlap any existing
+    object in ``b`` (intersection / area < ``max_overlap``), pastes their exact pixel rectangles on
+    GPU via a vectorized broadcast mask, and appends their boxes/labels while preserving static
+    ``[B, max_boxes]`` shapes and ``channels_last`` layout.
+    """
+    B, _, H, W = images.shape
+    M = boxes.shape[1]
+    k_paste = min(int(max_paste), M)
+    if B <= 1 or float(prob) <= 0.0 or k_paste <= 0:
+        return images, boxes, labels, valid
+
+    dev = images.device
+    shift = random.randint(1, B - 1)
+    perm = (torch.arange(B, device=dev) + shift) % B
+    active = torch.rand(B, device=dev, generator=generator) < float(prob)
+
+    p_boxes = boxes[perm]     # [B, M, 4] cxcywh norm
+    p_labels = labels[perm]   # [B, M]
+    p_valid = valid[perm]     # [B, M]
+
+    # Candidate filter: valid, non-crowd (label < 10_000), small/medium area, >= 8px wide & tall
+    pw = p_boxes[..., 2]
+    ph = p_boxes[..., 3]
+    p_area = pw * ph
+    min_w = 8.0 / max(float(W), 1.0)
+    min_h = 8.0 / max(float(H), 1.0)
+    cand = p_valid & (p_labels < 10_000) & (p_area <= float(max_area)) & (pw >= min_w) & (ph >= min_h)
+
+    # Check overlap against all existing valid boxes in destination image b (avoid occluding real GT)
+    bx1 = boxes[..., 0] - 0.5 * boxes[..., 2]
+    by1 = boxes[..., 1] - 0.5 * boxes[..., 3]
+    bx2 = boxes[..., 0] + 0.5 * boxes[..., 2]
+    by2 = boxes[..., 1] + 0.5 * boxes[..., 3]
+    b_area = (boxes[..., 2] * boxes[..., 3]).clamp(min=1e-7)
+
+    px1 = p_boxes[..., 0] - 0.5 * pw
+    py1 = p_boxes[..., 1] - 0.5 * ph
+    px2 = p_boxes[..., 0] + 0.5 * pw
+    py2 = p_boxes[..., 1] + 0.5 * ph
+
+    ix1 = torch.maximum(px1[:, :, None], bx1[:, None, :])
+    iy1 = torch.maximum(py1[:, :, None], by1[:, None, :])
+    ix2 = torch.minimum(px2[:, :, None], bx2[:, None, :])
+    iy2 = torch.minimum(py2[:, :, None], by2[:, None, :])
+    inter = (ix2 - ix1).clamp(min=0.0) * (iy2 - iy1).clamp(min=0.0)   # [B, M_p, M_b]
+    occ_dst = inter / b_area[:, None, :]
+    occ_src = inter / p_area.clamp(min=1e-7)[:, :, None]
+    bad_overlap = ((occ_dst > float(max_overlap)) | (occ_src > float(max_overlap))) & valid[:, None, :]
+    cand = cand & (~bad_overlap.any(dim=2)) & active[:, None]
+
+    # Random priority slightly favoring smaller objects (boosts AP_s)
+    rand_prio = torch.rand(B, M, device=dev, generator=generator) + 0.25 * (1.0 - p_area.clamp(0.0, 1.0))
+    prio = torch.where(cand, rand_prio, rand_prio.new_full((), -1.0))
+    top_val, top_idx = prio.topk(k_paste, dim=1)                      # [B, K]
+    sel_valid = top_val > 0.0                                         # [B, K]
+    sel_boxes = p_boxes.gather(1, top_idx[..., None].expand(-1, -1, 4))
+    sel_labels = p_labels.gather(1, top_idx)
+
+    # Vectorized rectangular pixel mask [B, 1, H, W] -> zero loops, zero host sync
+    sx1 = ((sel_boxes[..., 0] - 0.5 * sel_boxes[..., 2]) * W).clamp(0.0, float(W))
+    sy1 = ((sel_boxes[..., 1] - 0.5 * sel_boxes[..., 3]) * H).clamp(0.0, float(H))
+    sx2 = ((sel_boxes[..., 0] + 0.5 * sel_boxes[..., 2]) * W).clamp(0.0, float(W))
+    sy2 = ((sel_boxes[..., 1] + 0.5 * sel_boxes[..., 3]) * H).clamp(0.0, float(H))
+
+    xs = torch.arange(W, device=dev, dtype=torch.float32).view(1, 1, 1, W) + 0.5
+    ys = torch.arange(H, device=dev, dtype=torch.float32).view(1, 1, H, 1) + 0.5
+    mx = (xs >= sx1[:, :, None, None]) & (xs < sx2[:, :, None, None])   # [B, K, 1, W]
+    my = (ys >= sy1[:, :, None, None]) & (ys < sy2[:, :, None, None])   # [B, K, H, 1]
+    paste_mask = ((mx & my) & sel_valid[:, :, None, None]).any(dim=1, keepdim=True)  # [B, 1, H, W]
+
+    is_cl = images.ndim == 4 and images.is_contiguous(memory_format=torch.channels_last)
+    partner_imgs = images[perm]
+    out_imgs = torch.where(paste_mask, partner_imgs, images)
+    if is_cl and not out_imgs.is_contiguous(memory_format=torch.channels_last):
+        out_imgs = out_imgs.contiguous(memory_format=torch.channels_last)
+
+    boxes_cat = torch.cat([boxes, sel_boxes], dim=1)
+    labels_cat = torch.cat([labels, sel_labels], dim=1)
+    valid_cat = torch.cat([valid, sel_valid], dim=1)
+
+    if max_boxes is not None and boxes_cat.shape[1] > max_boxes:
+        order = valid_cat.to(torch.uint8).argsort(dim=1, descending=True, stable=True)[:, :max_boxes]
+        boxes_cat = boxes_cat.gather(1, order[..., None].expand(-1, -1, 4))
+        labels_cat = labels_cat.gather(1, order)
+        valid_cat = valid_cat.gather(1, order)
+
+    return out_imgs, boxes_cat, labels_cat, valid_cat
+
+
+__all__ = ["GpuAugmenter", "gpu_batch_copy_paste", "gpu_batch_mixup"]

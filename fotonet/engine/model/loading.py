@@ -24,13 +24,57 @@ class LoadingMixin:
 
         path = os.fspath(model_path)
         key = str(path).strip().lower()
+        from fotonet.versions import is_v2_model
+
+        if is_v2_model(key):
+            # v2 models share the v1.1 contract, so they take the v1.1 path from here on.
+            from fotonet.versions.v2.graph import build_v2_model
+            from fotonet.versions.v2.spec import get_spec as get_v2_spec
+
+            spec = get_v2_spec(key)
+            self.is_v1_1 = True
+            self.model_id = key
+            self.nc = spec.nc if nc is None else int(nc)
+            weights = None
+            if getattr(self, "_pretrained", True):
+                from fotonet.models.release import resolve_v2_release
+
+                weights = resolve_v2_release(key)
+            if weights is not None:
+                requested_nc = self.nc  # loading sets self.nc to the checkpoint's count
+                self._load_v11_checkpoint(str(weights), self._safe_torch_load(str(weights)))
+                if int(self.model.nc) != int(requested_nc):
+                    # Explicit class count: keep the pretrained backbone and neck, fresh class predictors.
+                    from fotonet.versions.v1_1.engine import transfer_weights
+
+                    target = build_v2_model(key, nc=requested_nc, imgsz=spec.imgsz).to(self.device)
+                    transfer_weights(self.model, target)
+                    self.model = target.eval()
+                    self.nc = requested_nc
+                    self._finish_v11_identity()
+                return True
+            if getattr(self, "_pretrained", True):
+                import warnings
+
+                warnings.warn(
+                    f"No published weights for '{key}' yet: this model is untrained and its "
+                    "predictions are meaningless. Train it, load a checkpoint, or pass "
+                    "pretrained=False to build an untrained model without this warning.",
+                    UntrainedModelWarning,
+                    stacklevel=3,
+                )
+            self.model = build_v2_model(key, nc=self.nc, imgsz=spec.imgsz).to(self.device).eval()
+            self._finish_v11_identity()
+            return True
         if key in FAMILY:
             spec = get_spec(key)
             self.is_v1_1 = True
             self.model_id = key
             self.nc = spec.nc if nc is None else int(nc)
             weights = None
-            if getattr(self, "_pretrained", True):
+            from fotonet.versions.v1_1.spec import V11_ALPHA_IDS
+
+            if getattr(self, "_pretrained", True) and key not in V11_ALPHA_IDS:
                 from fotonet.models.release import resolve_v11_release
 
                 weights = resolve_v11_release(key)
@@ -86,7 +130,9 @@ class LoadingMixin:
                     raw = json.load(handle)
             except (OSError, json.JSONDecodeError):
                 return False
-            if not str(raw.get("graph_version", "")).startswith("1.1"):
+            from fotonet.versions import shares_v11_contract
+
+            if not shares_v11_contract(raw.get("graph_version")):
                 return False
             metadata = validate_v11_metadata(raw, "onnx" if suffix == ".onnx" else "torchscript")
             self._load_v11_runtime(path, metadata)
@@ -99,9 +145,13 @@ class LoadingMixin:
         from fotonet.versions.v1_1.graph import build_from_config
         from fotonet.versions.v1_1.spec import fingerprint_matches, get_spec
 
+        from fotonet.versions import is_v2_model
+
         cfg = dict(checkpoint.get("model_config") or {})
         model_id = cfg.get("model_id", "fotonetn")
-        ckpt_nc = int(cfg.get("nc", get_spec(model_id).nc))
+        if is_v2_model(model_id):
+            from fotonet.versions.v2.spec import fingerprint_matches, get_spec
+        ckpt_nc = int(cfg["nc"]) if cfg.get("nc") is not None else int(get_spec(model_id).nc)
         if nc is not None and int(nc) != ckpt_nc:
             raise ValueError(f"Checkpoint nc={ckpt_nc} does not match requested nc={nc}.")
         model = build_from_config(model_id, cfg, nc=ckpt_nc).to(self.device).eval()

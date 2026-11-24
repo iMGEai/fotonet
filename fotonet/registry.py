@@ -114,6 +114,7 @@ def canonical_version(name: str, version: str) -> str:
 
 def get(name: str, major: int | None = None) -> PartInfo:
     """The newest version of ``name``; with ``major``, the newest ``major.MINOR.PATCH`` (never a release version)."""
+    _load_builtins()
     versions = _PARTS.get(str(name))
     if not versions:
         raise KeyError(f"no part named {name!r}.")
@@ -127,6 +128,7 @@ def get(name: str, major: int | None = None) -> PartInfo:
 def resolve(ref: str) -> PartInfo:
     """``"nn.cspstar@1"`` (newest 1.x.y), ``"nn.cspstar@1.0.0"`` or ``"sched.lr@1.2"`` (exact), or
     ``"nn.cspstar"`` (newest). A renamed part's old ref resolves to its new one."""
+    _load_builtins()
     ref = _ALIASES.get(str(ref), str(ref))
     name, _, version = ref.partition("@")
     if not version:
@@ -168,6 +170,7 @@ def lockfile(objects) -> dict[str, str]:
 def _load_builtins():
     import fotonet.nn  # noqa: F401  (registers the built-in blocks)
     import fotonet.train  # noqa: F401  (registers the built-in training parts)
+    import fotonet.versions.v2  # noqa: F401  (registers the built-in v2 parts)
 
 
 __all__ = ["KINDS", "PartInfo", "alias", "canonical_version", "get", "lockfile", "part", "parts", "register",

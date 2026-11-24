@@ -22,17 +22,17 @@ pip install fotonet
 
 ## Run inference
 
-Load the released `fotonetn` checkpoint from the GitHub Release by passing the
-model ID to `Fotonet`:
+Load the released `fotonet2n` (v2) or `fotonetn` (v1.1) checkpoint from GitHub
+Releases by passing the model ID:
 
 ```python
 from fotonet import Fotonet
 
-model = Fotonet("fotonetn")
+model = Fotonet("fotonet2n")
 results = model.predict("image.jpg", conf=0.25, imgsz=640)
 
 for detection in results[0].boxes:
-    print(detection.cls, detection.conf, detection.xyxy)
+    print(detection.cls, detection.conf, detection.xyxy)  # pixel corners (x1, y1, x2, y2)
 ```
 
 ## Train a model
@@ -41,15 +41,15 @@ Prepare a YAML dataset configuration and start a run:
 
 ```bash
 fotonet train \
-  model=fotonetn \
+  model=fotonet2n \
   data=path/to/data.yaml \
   epochs=100 \
   batch=16 \
   imgsz=640 \
-  run_dir=runs/fotonetn
+  run_dir=runs/fotonet2n
 ```
 
-Use `resume=runs/fotonetn/fotonet_last.pt` to continue an interrupted run.
+Use `resume=runs/fotonet2n/fotonet2n_last.pt` to continue an interrupted run.
 Training outputs and model weights stay outside the Git source tree.
 
 ## Checkpoints and measurements

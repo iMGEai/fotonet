@@ -152,10 +152,11 @@ def measure(model, model_id=None, imgsz=IMGSZ, peers=YOLO27):
     )
 
 
-def family_reports(imgsz=IMGSZ):
-    from .spec import V11_MODEL_IDS
+def family_reports(imgsz=IMGSZ, include_alpha=False):
+    from .spec import V11_ALPHA_IDS, V11_MODEL_IDS
 
-    return [measure(model_id, imgsz=imgsz) for model_id in V11_MODEL_IDS]
+    ids = V11_MODEL_IDS + V11_ALPHA_IDS if include_alpha else V11_MODEL_IDS
+    return [measure(model_id, imgsz=imgsz) for model_id in ids]
 
 
 def format_table(reports):
@@ -174,7 +175,7 @@ def format_table(reports):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    reports = family_reports()
+    reports = family_reports(include_alpha="--alpha" in argv)
     if "--json" in argv:
         print(json.dumps([r.to_dict() for r in reports], indent=2))
     else:

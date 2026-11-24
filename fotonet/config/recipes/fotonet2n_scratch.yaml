@@ -1,0 +1,116 @@
+# fotonet v2 scratch recipe: fotonet2n (Hi Bird) from random weights.
+# Pure from-scratch 300-epoch COCO recipe:
+# - Architecture: R-ELAN Area Attention + HyperACE/FullPAD-Lite + GeoSA Top-300 decoder.
+# - Trainer profile "2.0": DEIM MAL, GT-size-normalized L1, stride-8 tal_small,
+#   vectorized GPU 1-to-1 GeoSA deep supervision, static-shape 64-query CDN, self-distillation.
+# - Optimizer: selective MuAdamW (Muon on hidden dense matrices, AdamW 0.15x LR on stem/DW/attention/decoder/heads).
+# - Schedule: 300-epoch WSD-Cosine (5 warmup + 90 peak + 205 smooth cosine decay) with 30-epoch clean tail
+#   (mosaic, mixup, and GPU copy-paste all closed at epoch 271).
+
+model: fotonet2n
+pretrained: false
+resume: false
+trainer: "2.0"
+
+train:
+  epochs: 300
+  imgsz: 640
+  imgsz_schedule: null
+  nbs: 64
+  batch: 32
+  workers: 4
+  predecode: false
+  predecode_dir: null
+  predecode_max_side: 720
+  close_mosaic: 30
+  mosaic_dense: 0.25
+  mosaic_dense_from: 0.15
+  mosaic_dense_to: 0.70
+  gpu_mixup: true
+  gpu_copy_paste: true
+  out_dir: runs/train
+  lr_scheduler: wsd
+  wsd_shape: cosine
+  wsd_decay_epochs: 205
+  grad_clip: 10.0
+  val_period: 5
+  val_final_epochs: 30
+  val_batch: 32
+  val_workers: 4
+  val_fused: true
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 5.0
+  forecast: true
+  o2m_mult: 1.0
+  o2o_groups: 1
+  o2o_detach: true
+  o2o_body_grad_scale: 0.35
+  ema_average_last: 10
+  ema_average_every: 2
+
+optimizer:
+  name: muadamw
+  lr0: 0.01
+  lrf: 0.005
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 5
+  lr_mult:
+    adamw: 0.15
+  ema_decay: 0.9997
+  ema_tau: 2000
+
+augment:
+  mosaic: 1.0
+  mixup: 0.15
+  copy_paste: 0.15
+  allow_bbox_copy_paste: true
+  scale: 0.5
+  fliplr: 0.5
+  flipud: 0.0
+  degrees: 0.0
+  shear: 0.0
+  translate: 0.1
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  bgr: 0.0
+
+loss:
+  w_box: 7.5
+  w_cls: 0.5
+  w_l1: 1.5
+  w_obj: 0.0
+  w_dec: 1.0
+  w_cdn: 0.5
+  mal_gamma: 0.0
+  w_distill: 0.0
+  w_dup: 0.0
+  w_distill_box: 2.0
+  prog_o2m_start: 1.0
+  prog_o2m_end: 0.25
+  prog_o2m_floor: 0.25
+  prog_o2o_start: 0.6
+  prog_total: 1.0
+  loss_scale: 1.0
+
+knob_schedule:
+  - {epoch: 75, o2o_detach: false}
+  - {epoch: 95, o2o_distill: 0.35}
+  - {epoch: 210, o2o_distill: 0.5}
+
+matcher:
+  alpha: 1.0
+  beta: 6.0
+  topk: 10
+  o2o_candidates: 4
+  o2o_topk: 1
+  tal_small: true
+  mmax: 160
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

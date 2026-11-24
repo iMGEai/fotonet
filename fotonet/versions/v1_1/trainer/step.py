@@ -5,7 +5,8 @@ import torch
 
 from fotonet.utils.console import log_event
 
-from fotonet.train.distill import decode_labels
+from fotonet.data.coco import CROWD_Q
+from fotonet.train.distill import CODE_STRIDE, decode_labels
 from fotonet.train.losses import o2o_branch_loss
 from fotonet.train.assign import o2o_group_targets
 from .data import _m_bucket
@@ -127,7 +128,8 @@ class TrainStep:
 
     def __init__(self, *, cfg, model, compiled, match, loss, opt, ema, scaler, augmenter, dev, mmax,
                  use_compile, use_amp, amp_dtype, channels_last, decode_targets, teacher, single_cls,
-                 groups_on, accum_steps, prof, match_v2=False, loss_v2=False, group_assign=None, group_loss=None):
+                 groups_on, accum_steps, prof, match_v2=False, loss_v2=False, group_assign=None, group_loss=None,
+                 loss_v13=False, criterion=None, crowd_rows=False):
         self.cfg = cfg
         self.model = model
         self.compiled = compiled
@@ -151,6 +153,17 @@ class TrainStep:
         self.prof = prof
         self.match_v2 = bool(match_v2)
         self.loss_v2 = bool(loss_v2)
+        self.loss_v13 = bool(loss_v13)
+        # Trainer 2.0: one callable does the assignment and the loss of every head and pass.
+        self.criterion = criterion
+        self.progress = 0.0
+        # COCO crowd regions arrive as label rows with a crowd code; they leave the targets here and
+        # reach the criterion as regions its class loss skips.
+        self.crowd_rows = bool(crowd_rows)
+        self.ignore = None
+        # Anchor centres in pixels per image size, from the first forward pass at that size: the
+        # criterion's ground-truth work then runs before the next forward passes.
+        self.anchors = {}
         self.group_assign = group_assign if group_assign is not None else o2o_group_targets
         self.group_loss = group_loss if group_loss is not None else o2o_branch_loss
         self.group_v2 = self.group_loss is not o2o_branch_loss
@@ -162,11 +175,13 @@ class TrainStep:
                  o2o_prior_mix=None):
         """Run one micro-step. Returns ``(loss row, dropped-batch count, batch size)`` as device tensors."""
         images, gtmap, lab, mask, gt_weight = self._batch(imgs, targets)
+        self.progress = (int(epoch) - 1) / max(int(self.cfg["epochs"]) - 1, 1)
+        plan = self._plan(images, gtmap, lab, mask)
         self.prof.mark("augment")
         for group in self.opt.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * float(group.get("lr_mult", 1.0))
         total, parts, finite = self._losses(images, gtmap, lab, mask, gt_weight, use_o2m, quality_mix, prior_mix,
-                                            o2o_prior_mix)
+                                            o2o_prior_mix, plan=plan)
         # The last window of an epoch can be short (n_steps not a multiple of
         # accum_steps); average over the batches it really has.
         window_start = (step_i // self.accum_steps) * self.accum_steps
@@ -202,11 +217,22 @@ class TrainStep:
                     labels[index, :count] = target["labels"][:count].to(dev)
                     valid[index, :count] = True
         max_gt = max((int(target["boxes"].shape[0]) for target in targets), default=0)
+        if self.augmenter is not None:
+            if float(self.augmenter.hyp.get("mixup", 0.0)) > 0.0:
+                max_gt = max_gt * 2
+            if float(self.augmenter.hyp.get("copy_paste", 0.0)) > 0.0:
+                max_gt = max_gt + 3
         m_used = mmax if self.use_compile else _m_bucket(max_gt, mmax)
         gtmap = boxes[:, :m_used]
         lab = labels[:, :m_used]
         mask = valid[:, :m_used]
         gt_weight = None
+        self.ignore = None
+        if self.crowd_rows:
+            crowd = mask & (torch.div(lab, CODE_STRIDE, rounding_mode="floor") == CROWD_Q)
+            self.ignore = (gtmap, lab - CODE_STRIDE * CROWD_Q, crowd)
+            mask = mask & ~crowd
+            lab = torch.where(crowd, torch.zeros_like(lab), lab)
         if self.decode_targets:
             lab, weights = decode_labels(lab)
             if self.teacher is not None:
@@ -217,7 +243,22 @@ class TrainStep:
             images = images.contiguous(memory_format=torch.channels_last)
         return images, gtmap, lab, mask, gt_weight
 
-    def _losses(self, images, gtmap, lab, mask, gt_weight, use_o2m, qm, prior, o2o_prior=None):
+    def _plan(self, images, gtmap, lab, mask):
+        """The criterion's ground-truth work (trainer 2.0), run before the forward pass.
+
+        It is the only part of the criterion that waits for the device; before the forward pass
+        there is little queued work to wait for. None until a forward pass at this image size has
+        given the anchors; the criterion then does this work itself.
+        """
+        if self.criterion is None or not hasattr(self.criterion, "prepare"):
+            return None
+        anchors = self.anchors.get(tuple(images.shape[-2:]))
+        if anchors is None:
+            return None
+        return self.criterion.prepare(gtmap, lab, mask, float(images.shape[-2]), float(images.shape[-1]), anchors,
+                                      int(self.model.nc), ignore=self.ignore)
+
+    def _losses(self, images, gtmap, lab, mask, gt_weight, use_o2m, qm, prior, o2o_prior=None, plan=None):
         """Forward, matching, and loss. Returns ``(masked total, loss parts, finite flag)``."""
         cfg = self.cfg
         if self.use_amp:
@@ -226,6 +267,16 @@ class TrainStep:
         else:
             out = self.compiled(images, use_o2m=use_o2m)
         self.prof.mark("forward")
+        if self.criterion is not None:
+            size = tuple(images.shape[-2:])
+            if size not in self.anchors:
+                self.anchors[size] = (out["anchor_points"].float() * out["stride_tensor"].float()).detach()
+            extra = {} if plan is None else {"plan": plan}
+            total, parts = self.criterion(out, gtmap, lab, mask, float(images.shape[-2]),
+                                          float(images.shape[-1]), self.progress, ignore=self.ignore, **extra)
+            self.prof.mark("assign_loss")
+            finite = torch.isfinite(total)
+            return torch.where(finite, total, torch.zeros_like(total)), parts, finite
         anchors = out["anchor_points"].float()
         strides = out["stride_tensor"].float()
         o2m_logits = out.get("pred_logits_o2m")
@@ -260,6 +311,7 @@ class TrainStep:
             w_obj=float(cfg["w_obj"]), w_runner_up=float(cfg["w_runner_up"]),
             o2o_neg_alpha=float(cfg["o2o_neg_alpha"]), o2o_neg_gamma=float(cfg["o2o_neg_gamma"]),
             **({k: cfg[k] for k in _LOSS_V2_KEYS} if self.loss_v2 else {}),
+            **({"o2o_distill": float(cfg["o2o_distill"])} if self.loss_v13 else {}),
         )
         total, l_cls, l_box, l_cls_m, l_box_m, l_cons, l_obj = values
         if self.groups_on and "pred_logits_o2o_groups" in out:

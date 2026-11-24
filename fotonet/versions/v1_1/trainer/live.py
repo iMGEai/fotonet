@@ -27,13 +27,14 @@ from .options import DEFAULTS
 LIVE_KEYS = frozenset({
     # loss
     "w_box", "w_o2o", "w_cons", "w_obj", "w_runner_up", "w_group", "o2o_neg_alpha", "o2o_neg_gamma",
-    "iou_type", "o2o_cls", "o2o_q_gamma", "o2o_prior_epochs", "o2m_target",
+    "iou_type", "o2o_cls", "o2o_q_gamma", "o2o_prior_epochs", "o2m_target", "o2o_distill",
+    "w_distill", "w_dup", "prog_o2m_floor", "prog_o2o_start", "w_dec", "w_cdn", "mal_gamma",
     # assignment
     "alpha", "beta", "topk", "o2o_topk", "o2o_beta", "o2o_center_prior", "radius", "slack_cells",
     "o2o_metric", "matcher_candidates",
     # ramps and the auxiliary head
     "quality_start_epoch", "quality_warmup_epochs", "center_prior_epochs",
-    "o2m_every_n_steps", "o2m_start_epoch", "o2m_disable_epoch", "o2o_detach",
+    "o2m_every_n_steps", "o2m_start_epoch", "o2m_disable_epoch", "o2o_detach", "o2o_body_grad_scale",
     # optimizer, learning-rate schedule and EMA
     "lr_scale", "lr0", "lrf", "weight_decay", "momentum", "grad_clip", "warmup_epochs",
     "wsd_decay_fraction", "lr_scheduler", "ema_decay", "ema_tau", "wsd_decay_epochs", "wsd_shape",
@@ -50,7 +51,7 @@ SCHEDULE_KEYS = frozenset({"warmup_epochs", "wsd_decay_fraction", "lr_scheduler"
 CHOICES = {
     "o2o_metric": {"consistent", "self"},
     "iou_type": {"siou", "ciou"},
-    "lr_scheduler": {"wsd", "cosine", "decay"},
+    "lr_scheduler": {"wsd", "wss", "cosine", "decay"},
     "o2o_cls": {"bce", "mal", "vfl"},
     "o2m_target": {"iou", "tal"},
     "wsd_shape": {"cosine", "linear", "sqrt"},

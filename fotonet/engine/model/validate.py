@@ -117,7 +117,7 @@ class ValidateMixin:
             if runtime_imgsz is None:
                 raise RuntimeError(
                     f"Cannot validate this static {runtime_format} artifact without its input-shape metadata. "
-                    "Re-export it with FOTO-NET so the adjacent metadata file is produced."
+                    "Re-export it with fotonet so the adjacent metadata file is produced."
                 )
             eval_imgsz = tuple(int(value) for value in runtime_imgsz)
             if imgsz is not None and self._normalize_imgsz(imgsz) != eval_imgsz:

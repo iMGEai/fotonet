@@ -1,0 +1,112 @@
+# FOTONET v1.3 scratch recipe: fotonetnr, the alpha layout (docs/internal/layer-reallocation.md), with the
+# same training as fotonetn_scratch_v13, so the two differ by the layout alone. No published weights.
+
+model: fotonetnr
+pretrained: false
+resume: false
+trainer: "1.3"
+
+train:
+  epochs: 500
+  imgsz: 640
+  # 512 px for epochs 1-30, 576 px for 31-60, 640 px from 61 on.
+  imgsz_schedule:
+    - [0.06, 512]
+    - [0.06, 576]
+    - [0.88, 640]
+  nbs: 128
+  batch: 16
+  workers: 4
+  predecode: false
+  predecode_dir: null
+  predecode_max_side: 720
+  close_mosaic: 60
+  mosaic_dense: 0.3
+  mosaic_dense_from: 0.3
+  mosaic_dense_to: 0.8
+  out_dir: runs/train
+  lr_scheduler: wss
+  wss_stable_end: 250
+  wss_decay_end: 300
+  wss_settle_end: 400
+  wss_settle: 0.4
+  grad_clip: 10.0
+  val_period: 5
+  val_final_epochs: 50
+  val_batch: 32
+  val_workers: 4
+  val_fused: true
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 5.0
+  forecast: true
+  o2m_mult: 1.0
+  o2o_groups: 1
+  ema_average_last: 10
+  ema_average_every: 4
+
+optimizer:
+  name: adamw
+  lr0: 0.001
+  lrf: 0.01
+  weight_decay: 0.05
+  warmup_epochs: 5
+  ema_decay: 0.99985
+  ema_tau: 2000
+
+augment:
+  mosaic: 0.90
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.5
+  fliplr: 0.606
+  flipud: 0.0
+  degrees: 1.11
+  shear: 1.46
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.106
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  quality_start_epoch: 3
+  quality_warmup_epochs: 8
+  center_prior_epochs: 6
+  o2o_prior_epochs: 6
+  o2o_cls: bce
+  o2o_q_gamma: 1.0
+  w_runner_up: 1.5
+  o2o_neg_alpha: 1.0
+  o2o_neg_gamma: 1.0
+  o2o_distill: 0.0
+
+knob_schedule:
+  - {epoch: 200, o2o_distill: 0.5}
+
+o2m:
+  every_n_steps: 1
+  disable_epoch: 0
+  start_epoch: 1
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  o2o_metric: consistent
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+  o2m_target: iou
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

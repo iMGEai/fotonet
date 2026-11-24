@@ -248,8 +248,6 @@ def load_mosaic_v2(dataset, index, imgsz=None, max_retries=2):
 
 
 def _load_mosaic_v2_once(dataset, index, imgsz):
-    import cv2
-
     hyp = dataset.augment_hyp
     scl = float(hyp.get("scale", 0.0))
     trn = float(hyp.get("translate", 0.0))
@@ -293,6 +291,90 @@ def _load_mosaic_v2_once(dataset, index, imgsz):
             area = np.maximum(area[:, 2] - area[:, 0], 0.0) * np.maximum(area[:, 3] - area[:, 1], 0.0)
             all_boxes.append(np.concatenate((xyxy, area[:, None]), 1))
             all_labels.append(labels)
+    return _finish_zoomed_canvas(canvas, all_boxes, all_labels, source_count, imgsz, k, tx, ty)
+
+
+# aug.mosaic@1.3: each image of a nine-image mosaic is resized to this share of the output size.
+DENSE_TILE_SCALE = 0.75
+
+
+def dense_mosaic_cells(size):
+    """Nine cells ``(x1, y1, x2, y2)`` of a jittered 3x3 grid on the 2x canvas, in row order."""
+    def cuts():
+        return 0, int(random.uniform(0.5, 0.83) * size), int(random.uniform(1.17, 1.5) * size), int(size) * 2
+
+    xs, ys = cuts(), cuts()
+    return [(xs[c], ys[r], xs[c + 1], ys[r + 1]) for r in range(3) for c in range(3)]
+
+
+def dense_tile_rect(cell, w, h):
+    """Center a ``w`` by ``h`` image in ``cell``, cropped to it: ``(x1a, y1a, x2a, y2a, x1b, y1b)``."""
+    cx1, cy1, cx2, cy2 = cell
+    cw, ch = cx2 - cx1, cy2 - cy1
+    if w >= cw:
+        x1a, x2a, x1b = cx1, cx2, (w - cw) // 2
+    else:
+        x1a, x2a, x1b = cx1 + (cw - w) // 2, cx1 + (cw - w) // 2 + w, 0
+    if h >= ch:
+        y1a, y2a, y1b = cy1, cy2, (h - ch) // 2
+    else:
+        y1a, y2a, y1b = cy1 + (ch - h) // 2, cy1 + (ch - h) // 2 + h, 0
+    return x1a, y1a, x2a, y2a, x1b, y1b
+
+
+def load_mosaic_v3(dataset, index, imgsz=None, max_retries=2):
+    """``aug.mosaic@1.3`` on the CPU path; see ``fotonet.data.gpu_loader.mosaic_geometry_v3``."""
+    if random.random() >= float(getattr(dataset, "mosaic_dense", 0.0) or 0.0):
+        return load_mosaic_v2(dataset, index, imgsz, max_retries)
+    imgsz = int(imgsz or dataset.imgsz)
+    best = None
+    for _ in range(max_retries + 1):
+        img, boxes, labels, source_count = _load_dense_mosaic_once(dataset, index, imgsz)
+        if source_count == 0 or len(labels) > 0:
+            return img, boxes, labels
+        if best is None:
+            best = (img, boxes, labels)
+    return best
+
+
+def _load_dense_mosaic_once(dataset, index, imgsz):
+    hyp = dataset.augment_hyp
+    scl = float(hyp.get("scale", 0.0))
+    trn = float(hyp.get("translate", 0.0))
+    k = random.uniform(max(1.0 - scl, 0.05), 1.0 + scl)
+    tx = random.uniform(-trn, trn) * imgsz
+    ty = random.uniform(-trn, trn) * imgsz
+    tile = max(int(round(imgsz * DENSE_TILE_SCALE)), 1)
+    cells = dense_mosaic_cells(imgsz)
+    indices = [_sample_dataset_index(dataset) for _ in cells]
+    indices[len(cells) // 2] = index
+    canvas = np.full((imgsz * 2, imgsz * 2, 3), 114, dtype=np.uint8)
+    all_boxes, all_labels = [], []
+    source_count = 0
+    for cell, idx in zip(cells, indices):
+        img, target = dataset.get_raw(idx)
+        boxes, labels = target["boxes"], target["labels"]
+        source_count += len(labels)
+        img = resize_longest_side(img, tile)
+        h, w = img.shape[:2]
+        x1a, y1a, x2a, y2a, x1b, y1b = dense_tile_rect(cell, w, h)
+        x2b, y2b = x1b + (x2a - x1a), y1b + (y2a - y1a)
+        canvas[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+        if len(boxes) > 0:
+            xyxy = xywhn_to_xyxy(boxes, w, h)
+            area = np.maximum(xyxy[:, 2] - xyxy[:, 0], 0.0) * np.maximum(xyxy[:, 3] - xyxy[:, 1], 0.0)
+            xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], x1b, x2b) + (x1a - x1b)
+            xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], y1b, y2b) + (y1a - y1b)
+            all_boxes.append(np.concatenate((xyxy, area[:, None]), 1))
+            all_labels.append(labels)
+    return _finish_zoomed_canvas(canvas, all_boxes, all_labels, source_count, imgsz, k, tx, ty)
+
+
+def _finish_zoomed_canvas(canvas, all_boxes, all_labels, source_count, imgsz, k, tx, ty):
+    """Zoom the 2x canvas by ``k``, shift by ``(tx, ty)``, cut the output window, and map the boxes."""
+    import cv2
+
+    large = imgsz * 2
     side = max(int(round(large * k)), 1)
     f = side / large
     scaled = cv2.resize(canvas, (side, side), interpolation=cv2.INTER_AREA if f < 1.0 else cv2.INTER_LINEAR)

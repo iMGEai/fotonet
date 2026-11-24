@@ -21,6 +21,9 @@ DEFAULTS = {
     "imgsz_schedule": None,
     "workers": 4,
     "optimizer": "adamw",
+    "lr_mult": None,
+    "fused": None,
+    "amp_dtype": None,
     "lr0": 1e-3,
     "lrf": 0.01,
     "momentum": 0.937,
@@ -28,7 +31,8 @@ DEFAULTS = {
     "warmup_epochs": 5,
     "ema_decay": 0.99985,
     "ema_tau": 2000.0,
-    # "wsd" (warmup, stable, decay), "cosine", or "decay" (decay only; finish).
+    # "wsd" (warmup, stable, decay), "wss" (warmup, stable, decay, stable, decay; sched.lr@1.3),
+    # "cosine", or "decay" (decay only; finish).
     "lr_scheduler": "wsd",
     "wsd_decay_fraction": 0.20,
     # WSD decay length in epochs; 0 = use wsd_decay_fraction. 300 of 500 with warmup 5 gives
@@ -36,6 +40,14 @@ DEFAULTS = {
     "wsd_decay_epochs": 0,
     # sched.lr@1.2 only: the decay's shape, "cosine" (v1), "linear" or "sqrt" (1 - sqrt).
     "wsd_shape": "cosine",
+    # WSS only: the last epoch of the first stable phase, of the first decay and of the second stable
+    # phase; the second decay ends the run. 0 takes 50%, 60% and 80% of the run: 250, 300 and 400 of
+    # 500 give 245 + 50 + 100 + 100 epochs after warmup.
+    "wss_stable_end": 0,
+    "wss_decay_end": 0,
+    "wss_settle_end": 0,
+    # WSS only: the second stable phase's learning rate, as a fraction of lr0.
+    "wss_settle": 0.4,
     "grad_clip": 10.0,
     "close_mosaic": 15,
     "mmax": 160,
@@ -57,6 +69,8 @@ DEFAULTS = {
     "o2m_disable_epoch": 0,
     # The deployed head reads detached features; only O2M trains the backbone.
     "o2o_detach": True,
+    # Straight-through gradient scale from deployed O2O/GeoSA head back into neck/backbone when o2o_detach=False.
+    "o2o_body_grad_scale": 1.0,
     "o2m_mult": 1.5,
     "o2o_groups": 1,
     "w_group": 1.0,
@@ -94,6 +108,48 @@ DEFAULTS = {
     "o2o_prior_epochs": -1,
     # assign.dual_o2o_o2m@1.2 only: the O2M positives' target, "iou" (v1) or "tal" (task-aligned).
     "o2m_target": "iou",
+    # loss.dual_o2o_o2m@1.3 only: how much of the O2M head's class score goes into the deployed head's
+    # targets on its positive anchors. 0 = none.
+    "o2o_distill": 0.0,
+    "w_distill": 0.0,
+    "w_dup": 0.0,
+    "w_distill_box": 2.0,
+    "dup_iou_thresh": 0.5,
+    # loss.tal@2.0 (trainer 2.0). Gains of the class, L1, decoder,
+    # CDN, and MAL gamma terms (w_box is shared); the one-to-one rule picks o2o_candidates anchors per
+    # object and keeps o2o_topk; tal_small widens the centre test for objects smaller than the first stride.
+    "w_cls": 0.5,
+    "w_l1": 1.5,
+    "w_dec": 1.0,
+    "w_cdn": 0.5,
+    "mal_gamma": 0.0,
+    "o2o_candidates": 7,
+    "tal_small": True,
+    # The head balance over the run: the O2M weight goes linearly from prog_o2m_start to prog_o2m_end,
+    # and the O2O weight goes from prog_o2o_start to prog_total.
+    "prog_o2m_start": 0.8,
+    "prog_o2m_end": 0.1,
+    "prog_o2m_floor": 0.0,
+    "prog_o2o_start": 0.6,
+    "prog_total": 1.0,
+    # Optional decoder context mode override for fotonet2n ("edge_sample" or "hyper_xattn").
+    "decoder_context": None,
+    # Multiplies the total loss. SGD takes its step size from it (set it to nbs); AdamW ignores it.
+    "loss_scale": 1.0,
+    # aug.mosaic@1.3 only: the share of mosaics that use nine images, inside the part of the run
+    # between the fractions mosaic_dense_from and mosaic_dense_to.
+    "mosaic_dense": 0.0,
+    "mosaic_dense_from": 0.0,
+    "mosaic_dense_to": 1.0,
+    # ema.average@1.3 only: average the EMA weights of the last N snapshots, taken every M epochs up
+    # to the final epoch, and write <model>_avg.pt. 0 = off.
+    "ema_average_last": 0,
+    "ema_average_every": 5,
+    # Validate a fused copy of the deployed graph instead of the training graph (faster, same boxes).
+    "val_fused": False,
+    # Train only the deployed head on the features of a finished model: the rest stays frozen, with
+    # its BatchNorm statistics held.
+    "head_refit": False,
     # Multiplies the scheduled learning rate; a live-tunable knob that leaves the schedule's shape alone.
     "lr_scale": 1.0,
     # Read live_settings.yaml in the output folder at every epoch start (see trainer/live.py).
@@ -109,6 +165,9 @@ DEFAULTS = {
     "max_images": 0,
     "fraction": 1.0,
     "single_cls": False,
+    # COCO train sources with the v2 criterion: anchors inside a crowd region are neither object nor
+    # background for that region's class. False trains them as background, as text labels do.
+    "crowd_ignore": True,
     "freeze": 0,
     "patience": 0,
     # Wall-clock budget in hours; the epoch count is refitted after epoch 1.
@@ -128,6 +187,8 @@ DEFAULTS = {
     "compile_augment": True,
     "gpu_augment": True,
     "gpu_decode": True,
+    "gpu_mixup": True,
+    "gpu_copy_paste": True,
     # Where JPEGs are decoded on the GPU-assembly path: "workers" (parallel
     # CPU decode of only the visible crop), "nvjpeg" (GPU), or "auto"
     # (workers when there are at least two of them).
@@ -167,7 +228,7 @@ _BACKBONE_ORDER = (
 )
 
 
-_HEAD_OPTION_KEYS = ("o2m_mult", "o2o_groups", "aux_objectness")
+_HEAD_OPTION_KEYS = ("o2m_mult", "o2o_groups", "aux_objectness", "decoder_context")
 
 
 def select_device(device=None) -> torch.device:

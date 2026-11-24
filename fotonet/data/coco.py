@@ -17,6 +17,110 @@ from fotonet.data.audit import AnnotationAudit
 from fotonet.data.dataset import DetectionDataset
 
 
+# A crowd region inside a training label row: ``code = class + CODE_STRIDE * CROWD_Q``. Teacher
+# pseudo-labels use the same code layout with weights 1..1000 (``fotonet.train.distill``), so 1500 is
+# free, and the largest code stays exact in float32. Crowd rows ride through mosaic, the affine warp
+# and flips like any box; the training step takes them out again before assignment.
+CROWD_Q = 1500
+
+
+class CocoLabels:
+    """What ``read_coco_labels`` returns: image paths, their label cache, class names and counts."""
+
+    def __init__(self, paths, cache, names, images, boxes, crowd, missing):
+        self.paths = paths
+        self.cache = cache
+        self.names = names
+        self.images = images
+        self.boxes = boxes
+        self.crowd = crowd
+        self.missing = missing
+
+
+def read_coco_labels(annotations, images=None, *, crowd_rows=True):
+    """Training labels straight from a COCO annotation JSON, without converting it to text files.
+
+    Returns a ``CocoLabels``: ``paths`` (every image of the JSON that is on disk, in JSON order) and
+    ``cache`` (index -> the label dict a ``DetectionDataset`` keeps per image). Boxes are clipped to
+    the image and stored as normalized cxcywh; categories become contiguous classes in id order.
+    With ``crowd_rows`` a crowd annotation is kept as a row whose label is a crowd code (see
+    ``CROWD_Q``); without it, crowd annotations are left out, as text conversions do.
+
+    Image files are not opened: sizes come from the JSON. Validation uses ``CocoDetectionDataset``,
+    which checks every file against the JSON and scores with the official protocol.
+    """
+    from fotonet.train.distill import CODE_STRIDE
+
+    annotation_path = os.path.abspath(os.fspath(annotations))
+    if not os.path.isfile(annotation_path):
+        raise FileNotFoundError(f"COCO annotation JSON does not exist: {annotation_path}")
+    image_root = os.path.abspath(os.fspath(images)) if images is not None else os.path.dirname(annotation_path)
+    if not os.path.isdir(image_root):
+        raise NotADirectoryError(f"COCO image directory does not exist: {image_root}")
+    with open(annotation_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    categories = sorted(payload.get("categories") or [], key=lambda category: int(category["id"]))
+    if not categories:
+        raise ValueError(f"{annotation_path} has no categories")
+    class_of = {int(category["id"]): index for index, category in enumerate(categories)}
+    names = {index: str(category.get("name", category["id"])) for index, category in enumerate(categories)}
+
+    rows = {}
+    sizes = {}
+    order = []
+    missing = 0
+    for image in payload.get("images") or []:
+        image_id = int(image["id"])
+        width, height = int(image["width"]), int(image["height"])
+        path = os.path.abspath(os.path.join(image_root, os.fspath(image["file_name"])))
+        if width <= 0 or height <= 0 or not os.path.isfile(path):
+            missing += 1
+            continue
+        sizes[image_id] = (float(width), float(height))
+        rows[image_id] = ([], [])
+        order.append((image_id, path))
+    boxes_total = crowd_total = 0
+    for annotation in payload.get("annotations") or []:
+        image_id = int(annotation["image_id"])
+        size = sizes.get(image_id)
+        class_id = class_of.get(int(annotation["category_id"]))
+        if size is None or class_id is None:
+            continue
+        crowd = bool(annotation.get("iscrowd", 0))
+        if (crowd and not crowd_rows) or (annotation.get("ignore", 0) and not crowd):
+            continue
+        x, y, w, h = (float(value) for value in annotation["bbox"])
+        width, height = size
+        x1, y1 = min(max(x, 0.0), width), min(max(y, 0.0), height)
+        x2, y2 = min(max(x + w, 0.0), width), min(max(y + h, 0.0), height)
+        if not (x2 > x1 and y2 > y1):
+            continue
+        boxes, labels = rows[image_id]
+        boxes.append(((x1 + x2) * 0.5 / width, (y1 + y2) * 0.5 / height, (x2 - x1) / width, (y2 - y1) / height))
+        labels.append(class_id + CODE_STRIDE * CROWD_Q if crowd else class_id)
+        boxes_total += not crowd
+        crowd_total += crowd
+    del payload
+
+    cache = {}
+    paths = []
+    for index, (image_id, path) in enumerate(order):
+        boxes, labels = rows[image_id]
+        boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        labels = np.asarray(labels, dtype=np.int64)
+        ordinary = labels < CODE_STRIDE
+        cache[index] = {
+            "boxes": boxes,
+            "labels": labels,
+            "eval_boxes": boxes[ordinary].copy(),
+            "eval_labels": labels[ordinary].copy(),
+            "eval_iscrowd": np.zeros((int(ordinary.sum()),), dtype=bool),
+            "eval_ignore": np.zeros((int(ordinary.sum()),), dtype=bool),
+        }
+        paths.append(path)
+    return CocoLabels(paths, cache, names, len(paths), int(boxes_total), int(crowd_total), int(missing))
+
+
 class CocoDetectionDataset(DetectionDataset):
     """A detection image pipeline backed by a COCO annotation JSON file."""
 

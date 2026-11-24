@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 MODELS_DIR = Path(__file__).resolve().parent / "models"
-GENERATIONS = {"v1.1": "v1_1"}
+GENERATIONS = {"v1.1": "v1_1", "v2": "v2"}
 _TOP_KEYS = {"model_id", "generation", "graph_version", "layout", "parts"}
 _V11_LAYOUT_KEYS = {
     "stem_channels", "p2_channels", "widths", "depths", "neck_channels", "neck_depths", "head_hidden",
@@ -24,7 +24,15 @@ def recipe_path(model_id: str, generation: str = "v1.1") -> Path:
     folder = GENERATIONS.get(str(generation))
     if folder is None:
         raise ValueError(f"unknown generation {generation!r}; expected one of {sorted(GENERATIONS)}.")
-    return MODELS_DIR / folder / f"{str(model_id).strip().lower()}.yaml"
+    path = MODELS_DIR / folder / f"{str(model_id).strip().lower()}.yaml"
+    if not path.is_file() and generation == "v1.1":
+        from fotonet.versions import is_v2_model
+
+        if is_v2_model(model_id):
+            v2_path = MODELS_DIR / GENERATIONS["v2"] / f"{str(model_id).strip().lower()}.yaml"
+            if v2_path.is_file():
+                return v2_path
+    return path
 
 
 def load_model_recipe(ref, generation: str = "v1.1") -> dict:
@@ -80,6 +88,23 @@ def validate_model_recipe(recipe: dict, *, budget: bool = False) -> dict:
             try:
                 validate_layout(**{key: tuple(v) if isinstance(v, list) else v for key, v in layout.items()},
                                 nc=80, reg_max=1)
+            except (TypeError, ValueError) as exc:
+                problems.append(str(exc))
+    if generation == "v2" and not problems:
+        from fotonet.versions.v2.spec import GRAPH_VERSION as V2_GRAPH_VERSION
+        from fotonet.versions.v2.spec import HYBRID_EXTRA_KEYS, LAYOUT_KEYS, normalize_layout
+        from fotonet.versions.v2.spec import validate_layout as validate_v2_layout
+
+        allowed_v2 = set(LAYOUT_KEYS) | set(HYBRID_EXTRA_KEYS)
+        missing_v2 = set(LAYOUT_KEYS) - set(layout)
+        extra_v2 = set(layout) - allowed_v2
+        if missing_v2 or extra_v2:
+            problems.append(f"v2 layout keys must contain {sorted(LAYOUT_KEYS)} (optional: {sorted(HYBRID_EXTRA_KEYS)}), got {sorted(layout)}")
+        else:
+            if str(recipe.get("graph_version")) != V2_GRAPH_VERSION:
+                problems.append(f"v2 graph_version is {V2_GRAPH_VERSION}, got {recipe.get('graph_version')!r}")
+            try:
+                validate_v2_layout(**normalize_layout(layout), nc=80, reg_max=1)
             except (TypeError, ValueError) as exc:
                 problems.append(str(exc))
     if problems:

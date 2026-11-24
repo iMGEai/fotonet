@@ -50,6 +50,12 @@ def _resolve_training_model(model, model_id, nc, imgsz, head_options=None):
     if model is None or isinstance(model, (str, os.PathLike)):
         ref = os.fspath(model if model is not None else (model_id or "fotonetn"))
         if not os.path.isfile(ref):
+            from fotonet.versions import is_v2_model
+
+            if is_v2_model(ref):
+                from fotonet.versions.v2.graph import build_v2_model
+
+                return build_v2_model(str(ref).strip().lower(), nc=nc, imgsz=imgsz, **head_options), None
             return V11Detector(str(ref).strip().lower(), nc=nc, imgsz=imgsz, **head_options), None
         ckpt = load_checkpoint(ref)
         if not is_v11_checkpoint(ckpt):
@@ -66,7 +72,7 @@ def _resolve_training_model(model, model_id, nc, imgsz, head_options=None):
     if int(model.nc) == int(nc) and model.head.has_o2m and same_head:
         return model, None
     config = dict(model.model_config)
-    config.update(wanted)
+    config.update({key: value for key, value in wanted.items() if value is not None})
     target = build_from_config(model.model_id, config, nc=int(nc), imgsz=imgsz)
     report = transfer_weights(model, target)
     target.trained_weights = bool(getattr(model, "trained_weights", False))
@@ -86,6 +92,22 @@ def _freeze(model, spec):
         if any(name.startswith(prefix) for prefix in prefixes):
             param.requires_grad_(False)
             frozen.append(name)
+    return frozen
+
+
+HEAD_REFIT_FROZEN = ("backbone", "neck", "head.o2m", "head.aux_obj")
+
+
+def _freeze_for_head_refit(model):
+    """Freeze everything but the deployed head and hold the frozen BatchNorm statistics.
+
+    The one-to-many head keeps running: its positives mark the runner-up anchors the deployed head's
+    loss pushes down.
+    """
+    frozen = _freeze(model, list(HEAD_REFIT_FROZEN))
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.BatchNorm2d) and name.startswith(tuple(p + "." for p in HEAD_REFIT_FROZEN)):
+            module.eval()
     return frozen
 
 

@@ -6,17 +6,21 @@ spatial relationships. It does not modify model output or confidence.
 
 ## Mental model
 
-`DetectionBox.xywh` is the original normalized detection. `box.transform` is a
-mutable working region initialized from that detection. Its coordinates use
-normalized `0..1` image space; pixel-prefixed properties and methods use the
-source image dimensions.
+`DetectionBox.xywh` and `DetectionBox.xyxy` return image-pixel tuples, while
+`DetectionBox.xywhn` and `DetectionBox.xyxyn` return normalized `0..1` coordinates
+matching `DetectionBoxes`. `box.transform` is a mutable working region initialized
+from the normalized detection. Its core properties (`xywh`, `xyxy`) use normalized
+`0..1` image space; pixel-prefixed properties (`pixel_xywh`, `pixel_xyxy`,
+`pixel_position`, `pixel_size`) and methods use the source image dimensions.
 
 ```python
 result = model.predict("image.jpg", retain_images=True)[0]
 box = result.boxes[0]
 
-print(box.xywh)                  # original normalized detection
-print(box.transform.xyxy)        # active normalized working region
+print(box.xywh)                  # original pixel detection (cx, cy, w, h)
+print(box.xywhn)                 # original normalized detection (0..1)
+print(box.transform.xyxy)        # active normalized working region (0..1)
+print(box.transform.pixel_xyxy)  # active working region in pixels
 print(tuple(box.transform.pixel_size))
 ```
 
@@ -115,7 +119,8 @@ mostly_inside = box.transform.pixel_contains(
 
 ## Properties
 
-- `xywh`, `xyxy`: active normalized geometry
+- `xywh`, `xyxy` (`xywhn`, `xyxyn`): active normalized geometry (`0..1`)
+- `pixel_xywh`, `pixel_xyxy`: active geometry in image pixels
 - `position`, `pixel_position`: active anchor position
 - `size`, `pixel_size`: active width and height
 - `corner[1..4]`: top-left, top-right, bottom-right, bottom-left

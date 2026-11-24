@@ -95,7 +95,9 @@ class TorchScriptRuntime(nn.Module):
                     "TorchScript artifact contains invalid embedded FOTO-NET metadata. "
                     "Re-export it with Fotonet.export(..., format='torchscript')."
                 ) from exc
-            if str(metadata.get("graph_version", "")).startswith("1.1"):
+            from fotonet.versions import shares_v11_contract
+
+            if shares_v11_contract(metadata.get("graph_version")):
                 from fotonet.versions.v1_1.api import validate_v11_metadata
 
                 metadata = validate_v11_metadata(metadata, "torchscript")

@@ -12,13 +12,13 @@ from torch.utils.data import DataLoader
 from fotonet.data.augmentations.hyp import build_augment_hyp
 from fotonet.data.dataset import build_detection_dataset
 from fotonet.engine.runtime import configure_data_worker
-from fotonet.registry import canonical_version, lockfile
+from fotonet.registry import canonical_version, lockfile, resolve as resolve_part
 from fotonet.utils.config import default_class_names
 from fotonet.utils.console import (
     AgyProgressBar, format_eta, log_event, print_completion_card, print_epoch_summary, print_train_card,
 )
 
-from ..api import V11_FORMAT, load_checkpoint, load_weights, save_payload
+from ..api import V11_FORMAT, deploy_for_inference, load_checkpoint, load_weights, save_payload
 from fotonet.train.distill import TeacherCache
 from ..graph import build_from_config
 from fotonet.data.augmentations.gpu import GpuAugmenter
@@ -33,14 +33,16 @@ from .options import (
 )
 from .schedule import _epoch_ramp, _lr_at, _o2m_enabled, _Schedule, _should_validate
 from .data import (
-    _close_loader, _collate, _epoch_data_plan, _load_data_cfg, _sample_fraction,
+    _align_labels, _close_loader, _collate, _epoch_data_plan, _load_coco_train, _load_data_cfg, _sample_fraction,
+    _subset_labels,
     _SingleClassView, _TrainDataset,
 )
-from .state import _EMA, _freeze, _resolve_training_model, _run_dir, capture_rng_state, restore_rng_state
+from .state import _EMA, _freeze, _freeze_for_head_refit, _resolve_training_model, _run_dir, capture_rng_state, restore_rng_state
 from .callbacks import _callbacks, _fire
 from .step import _EagerFallback, TrainStep
 from .live import LIVE_KEYS as LIVE_KEYS_SET, KnobSchedule, LiveTuner, SCHEDULE_KEYS
-from .profiles import PROFILE_DEFAULTS, after_v11, profile_name, resolve_parts
+from .profiles import PROFILE_DEFAULTS, after_v11, profile_name, release_at_least, resolve_parts
+from fotonet.train.autobatch import auto_batch
 from fotonet.train.probes import head_matrix, LivePreview
 from fotonet.train.forecast import plan_arrays, write_forecast
 
@@ -84,7 +86,11 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     matcher_part = run_parts["assigner"].obj
     loss_part = run_parts["loss"].obj
     lr_part = run_parts["lr_schedule"].obj
-    mosaic_version = 2 if after_v11(run_parts["mosaic"]) else 1
+    mosaic_version = 3 if release_at_least(run_parts["mosaic"], "1.3") else 2 if after_v11(run_parts["mosaic"]) else 1
+    if float(cfg.get("mosaic_dense") or 0.0) > 0.0 and mosaic_version < 3:
+        log_event("mosaic_dense needs aug.mosaic@1.3 (trainer 1.3); ignored.", level="warn")
+    averager_info = run_parts.get("ema_average")
+    criterion_info = run_parts.get("criterion")
     knob_steps = kwargs.get("knob_schedule")
     if knob_steps is None:
         knob_steps = recipe_cfg.get("knob_schedule")
@@ -111,6 +117,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         # spinning threads cost ~2.8 cores on a 4-core box.
         torch.set_num_threads(1)
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
         if torch.cuda.is_bf16_supported():
             amp_dtype, scaler, precision = torch.bfloat16, None, "cuda bf16"
@@ -125,10 +133,16 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     if bool(cfg["gpu_augment"]) and not gpu_aug:
         log_event("GPU augmentation needs CUDA; using the CPU augmentation path.", level="warn")
     gpu_decode = gpu_aug and bool(cfg["gpu_decode"])
-    if gpu_decode and (aug_hyp.get("mixup", 0.0) > 0.0 or aug_hyp.get("copy_paste", 0.0) > 0.0 or cfg["predecode"]):
-        log_event("GPU decode does not do mixup, copy-paste, or pre-decode; using the CPU loader.", level="warn")
+    gpu_mixup = bool(cfg.get("gpu_mixup", True))
+    gpu_copy_paste = bool(cfg.get("gpu_copy_paste", True))
+    if gpu_decode and ((aug_hyp.get("mixup", 0.0) > 0.0 and not gpu_mixup)
+                       or (aug_hyp.get("copy_paste", 0.0) > 0.0 and not gpu_copy_paste)
+                       or cfg["predecode"]):
+        log_event("GPU decode does not do CPU mixup, CPU copy-paste, or pre-decode; using the CPU loader.", level="warn")
         gpu_decode = False
-    channels_last = bool(cfg["channels_last"]) and dev.type == "cuda"
+    # With FP16 autocast, a training-mode BatchNorm on channels_last input takes a cuDNN path that is
+    # about 5x slower for the whole step (RTX 4060: 531 ms against 111 ms NCHW); bf16 is not affected.
+    channels_last = bool(cfg["channels_last"]) and dev.type == "cuda" and amp_dtype != torch.float16
     jpeg_decoder = str(cfg["jpeg_decoder"]).lower()
     if jpeg_decoder not in ("auto", "workers", "nvjpeg"):
         raise ValueError(f"jpeg_decoder must be 'auto', 'workers', or 'nvjpeg', got {cfg['jpeg_decoder']!r}.")
@@ -146,8 +160,26 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             if data_names and len(data_names) == nc_final
             else default_class_names(nc_final)
         )
+    # A COCO train source is read as it is. With the v2 criterion its crowd annotations stay in the
+    # labels as crowd rows, so the loss can leave those regions alone; older trainers get them left
+    # out, which is what a text conversion of COCO gives.
+    coco_labels = None
+    crowd_rows = False
+    if isinstance(train_target, dict):
+        crowd_rows = bool(cfg["crowd_ignore"]) and criterion_info is not None and not single_cls
+        coco = _load_coco_train(train_target, None if single_cls else nc_data, crowd_rows)
+        train_target, coco_labels = coco.paths, coco.cache
+        crowd_rows = crowd_rows and coco.crowd > 0
+        log_event(
+            f"COCO annotations: {coco.images} images, {coco.boxes} boxes, "
+            + (f"{coco.crowd} crowd regions kept out of the loss" if crowd_rows else "crowd annotations left out")
+            + (f", {coco.missing} images of the file not on disk" if coco.missing else "")
+        )
     if float(cfg["fraction"]) < 1.0:
-        train_target = _sample_fraction(train_target, cfg["fraction"])
+        sampled = _sample_fraction(train_target, cfg["fraction"])
+        if coco_labels is not None:
+            sampled, coco_labels = _subset_labels(train_target, coco_labels, sampled)
+        train_target = sampled
         log_event(f"fraction: training on {len(train_target)} images")
 
     head_options = {
@@ -155,6 +187,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         "o2o_groups": int(cfg["o2o_groups"]),
         "aux_objectness": float(cfg["w_obj"]) > 0.0,
     }
+    if cfg.get("decoder_context") is not None:
+        head_options["decoder_context"] = str(cfg["decoder_context"]).strip().lower()
     model, transfer = _resolve_training_model(model, model_id, nc_final, side, head_options)
     if transfer is not None:
         log_event(
@@ -162,6 +196,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             f"{len(transfer['reinitialized'])} initialized fresh (nc={nc_final})"
         )
     model.head.detach_o2o = bool(cfg["o2o_detach"])
+    if hasattr(model.head, "o2o_body_grad_scale"):
+        model.head.o2o_body_grad_scale = float(cfg["o2o_body_grad_scale"])
     if model.head.detach_o2o and int(cfg["o2m_every_n_steps"] or 1) > 1:
         log_event("o2o_detach: the O2M head is the backbone's only teacher, so it runs every step.")
         cfg["o2m_every_n_steps"] = 1
@@ -170,7 +206,14 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         model = model.to(memory_format=torch.channels_last)
     model.class_names = dict(names)
     model.train()
+    if str(cfg["batch"]).strip().lower() == "auto":
+        cfg["batch"] = auto_batch(model, side, dev, amp_dtype, int(cfg["nbs"]), channels_last=channels_last)
+        log_event(f"batch auto: {cfg['batch']} images per step")
+    else:
+        cfg["batch"] = int(cfg["batch"])
     frozen = _freeze(model, cfg["freeze"])
+    if bool(cfg["head_refit"]):
+        frozen = _freeze_for_head_refit(model)
     if frozen:
         log_event(f"freeze: {len(frozen)} parameter tensors frozen")
 
@@ -208,6 +251,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         )
         log_event(f"teacher pseudo-labels: {len(teacher)} images, conf >= {teacher.conf}, weight {teacher.weight}")
     max_images = int(cfg["max_images"] or 0)
+    dense_p = 0.0
 
     def make_dataset(image_dir, image_size, hyp, augment, labels=None):
         # ``labels``: an already loaded label cache to share instead of reading
@@ -222,6 +266,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         dataset.mosaic_buffer = max(int(cfg["mosaic_buffer"] or 0), 0)
         # aug.mosaic@1.2 leaves the rotation, shear and colour to the GPU augmenter.
         dataset.mosaic_version = mosaic_version if gpu_aug else 1
+        dataset.mosaic_dense = dense_p
         if labels is not None:
             dataset.cache = labels
         if max_images and max_images < len(dataset.img_files):
@@ -229,7 +274,9 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         dataset.set_total_epochs(int(cfg["epochs"]))
         return dataset
 
-    ds = make_dataset(train_target, side, aug_hyp, True)
+    ds = make_dataset(train_target, side, aug_hyp, True, labels=coco_labels)
+    if coco_labels is not None:
+        ds.cache = _align_labels(ds.img_files, train_target, coco_labels)
     if bool(cfg["predecode"]):
         from fotonet.data.predecode import ensure_cache
         root = cfg["predecode_dir"] or os.path.join(str(cfg["out_dir"]), "_predecode")
@@ -269,13 +316,19 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     opt = build_v11_optimizer(
         model, name=str(cfg["optimizer"]), lr=float(cfg["lr0"]),
         momentum=float(cfg["momentum"]), weight_decay=float(cfg["weight_decay"]),
-        fused=dev.type == "cuda",
+        fused=dev.type == "cuda", lr_mult=cfg.get("lr_mult"),
     )
     ema = _EMA(model, cfg["ema_decay"], tau=float(cfg["ema_tau"]))
     augmenter = None
     if gpu_aug:
         try:
-            augmenter = GpuAugmenter(aug_hyp, dev, side, mmax=mmax, compile_core=bool(cfg["compile_augment"]))
+            # The augmenter writes the images in the layout and type the model's first convolution
+            # reads (channels-last bfloat16 under bf16 autocast): the same values, without a copy
+            # and two casts per step.
+            augmenter = GpuAugmenter(
+                aug_hyp, dev, side, mmax=mmax, compile_core=bool(cfg["compile_augment"]), channels_last=channels_last,
+                out_dtype=amp_dtype if use_amp and amp_dtype == torch.bfloat16 else torch.float32,
+            )
         except Exception as exc:
             log_event(f"GPU augmentation unavailable ({exc}); using CPU augmentation.", level="warn")
             gpu_aug = gpu_decode = False
@@ -283,6 +336,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             loader = make_loader(ds)
     assembler = GpuMosaicAssembler(dev) if gpu_decode else None
 
+    averager = averager_info.obj() if averager_info is not None and int(cfg["ema_average_last"]) > 0 else None
     start_epoch, best_map, best_epoch = 1, -1.0, 0
     if resuming:
         if isinstance(resume, bool) or str(resume).strip().lower() in {"true", "1", "yes"}:
@@ -311,6 +365,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         if scaler is not None and ckpt.get("scaler"):
             scaler.load_state_dict(ckpt["scaler"])
         restore_rng_state(ckpt.get("rng"), augmenter)
+        if averager is not None and ckpt.get("ema_average"):
+            averager.load_state_dict(ckpt["ema_average"])
         start_epoch = int(ckpt["epoch"]) + 1
         best_map = float(ckpt.get("best_map", -1.0))
         best_epoch = int(ckpt.get("best_epoch", ckpt["epoch"]) or 0)
@@ -328,15 +384,51 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     use_compile = _resolve_compile(cfg["compile"], dev, steps_per_epoch * int(cfg["epochs"]))
     if use_compile:
         try:
+            import logging
+            logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
             torch._dynamo.config.recompile_limit = 16
             compiled = _EagerFallback(torch.compile(model, dynamic=False), model, "model")
-            match = _EagerFallback(torch.compile(matcher_part, dynamic=False), matcher_part, "matcher")
-            loss = _EagerFallback(torch.compile(loss_part, dynamic=False), loss_part, "loss")
+            if criterion_info is None:
+                match = _EagerFallback(torch.compile(matcher_part, dynamic=False), matcher_part, "matcher")
+                loss = _EagerFallback(torch.compile(loss_part, dynamic=False), loss_part, "loss")
             log_event("torch.compile enabled for the model, matcher, and loss (first steps compile).")
         except Exception as exc:
             log_event(f"torch.compile skipped ({exc}).", level="warn")
             compiled, match, loss = model, matcher_part, loss_part
             use_compile = False
+    criterion = None if criterion_info is None else criterion_info.obj(cfg, model.head.strides)
+    if criterion is not None and hasattr(criterion, "head_ref"):
+        criterion.head_ref = model.head
+    if criterion is not None and use_compile and getattr(criterion, "head_loss", None) is not None:
+        # Trainer 2.0: the per-head loss has fixed shapes (positives padded to a fixed count), so it
+        # compiles once per batch shape; the assignment around it stays eager. Separate entry points
+        # for O2O and O2M prevent guard collisions between their different positive row counts.
+        try:
+            if hasattr(criterion, "head_loss_o2o") and hasattr(criterion, "head_loss_o2m"):
+                criterion.head_loss_o2o = _EagerFallback(torch.compile(criterion.head_loss_o2o, dynamic=False),
+                                                         criterion.head_loss_o2o, "criterion_o2o")
+                criterion.head_loss_o2m = _EagerFallback(torch.compile(criterion.head_loss_o2m, dynamic=False),
+                                                         criterion.head_loss_o2m, "criterion_o2m")
+            else:
+                criterion.head_loss = _EagerFallback(torch.compile(criterion.head_loss, dynamic=False),
+                                                     criterion.head_loss, "criterion")
+            if hasattr(criterion, "distill_loss"):
+                criterion.distill_loss = _EagerFallback(torch.compile(criterion.distill_loss, dynamic=False),
+                                                        criterion.distill_loss, "criterion_distill")
+            if hasattr(criterion, "dup_loss"):
+                criterion.dup_loss = _EagerFallback(torch.compile(criterion.dup_loss, dynamic=False),
+                                                    criterion.dup_loss, "criterion_dup")
+            if hasattr(criterion, "query_loss"):
+                criterion.query_loss = _EagerFallback(torch.compile(criterion.query_loss, dynamic=False),
+                                                      criterion.query_loss, "criterion_query")
+            if hasattr(criterion, "cdn_layer_loss"):
+                criterion.cdn_layer_loss = _EagerFallback(torch.compile(criterion.cdn_layer_loss, dynamic=False),
+                                                          criterion.cdn_layer_loss, "criterion_cdn_loss")
+            if hasattr(criterion, "cdn_forward") and hasattr(model.head, "forward_cdn"):
+                criterion.cdn_forward = _EagerFallback(torch.compile(model.head.forward_cdn, dynamic=False),
+                                                       model.head.forward_cdn, "criterion_cdn_fwd")
+        except Exception as exc:
+            log_event(f"torch.compile skipped for the criterion ({exc}).", level="warn")
 
     val_loader = None
     val_model = None
@@ -393,9 +485,12 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     time_budget_applied = not float(cfg["time"] or 0.0) > 0.0
     opt.zero_grad(set_to_none=True)
 
-    def rebuild(image_size, mosaic):
+    def rebuild(image_size, mosaic, close_overlays=False):
         hyp = dict(aug_hyp)
         hyp["mosaic"] = float(mosaic)
+        if close_overlays:
+            hyp["mixup"] = 0.0
+            hyp["copy_paste"] = 0.0
         dataset = make_dataset(train_target, image_size, hyp, True, labels=ds.cache)
         if getattr(ds, "_predecode", None) is not None:
             dataset._predecode = ds._predecode
@@ -409,7 +504,10 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
     lr_now = lr0
     # Training parts used by this run, recorded in every checkpoint next to the model's own.
     train_parts = lockfile([loss_part, matcher_part, run_parts["group_assigner"].obj, run_parts["group_loss"].obj,
-                            _EMA, lr_part, _epoch_ramp, run_parts["mosaic"].obj])
+                            _EMA, lr_part, _epoch_ramp, run_parts["mosaic"].obj,
+                            *([averager_info.obj] if averager_info is not None else []),
+                            *([criterion_info.obj, resolve_part("assign.tal@2.0").obj]
+                              if criterion_info is not None else [])])
     step = TrainStep(
         cfg=cfg, model=model, compiled=compiled, match=match, loss=loss, opt=opt, ema=ema, scaler=scaler,
         augmenter=augmenter, dev=dev, mmax=mmax, use_compile=use_compile, use_amp=use_amp,
@@ -417,7 +515,24 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         single_cls=single_cls, groups_on=groups_on, accum_steps=accum_steps, prof=prof,
         match_v2=after_v11(run_parts["assigner"]), loss_v2=after_v11(run_parts["loss"]),
         group_assign=run_parts["group_assigner"].obj, group_loss=run_parts["group_loss"].obj,
+        loss_v13=release_at_least(run_parts["loss"], "1.3"),
+        criterion=criterion, crowd_rows=crowd_rows,
     )
+
+    def evaluate():
+        """Score the weights loaded in ``val_model`` on the validation set."""
+        from fotonet.engine.validation import evaluate_detection_model
+
+        target = val_model
+        if bool(cfg["val_fused"]):
+            target = deploy_for_inference(val_model, device=dev, dtype=torch.float32)
+            if channels_last:
+                target = target.to(memory_format=torch.channels_last)
+        return evaluate_detection_model(
+            target, val_loader, dev, nc_final, class_names=names, progress=False,
+            amp=bool(cfg["val_amp"]) and dev.type == "cuda",
+            coco_backend="fast" if bool(cfg["fast_val"]) else "pycocotools",
+        )
     # What Studio and the forecast need about this run: its parts and its whole plan, per epoch.
     ema_tau_epochs = (1.0 / max(1.0 - float(cfg["ema_decay"]), 1e-9)) / max(steps_per_epoch / accum_steps, 1.0)
     info_path = os.path.join(out_dir, "run_info.json")
@@ -432,6 +547,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                 "batch": int(cfg["batch"]), "lr0": lr0, "lrf": lrf, "lr_scheduler": plan.kind,
                 "wsd_shape": plan.shape, "warmup_epochs": int(cfg["warmup_epochs"]),
                 "decay_epoch": plan.decay_epoch(), "close_mosaic_epoch": plan.close_from,
+                "wss": plan.wss_info(),
                 "mosaic_version": mosaic_version if gpu_aug else 1, "val_period": int(cfg["val_period"]),
                 "val_final_epochs": plan.val_final, "probe_period": int(cfg["probe_period"]),
                 "preview_minutes": float(cfg["preview_minutes"]), "ema_tau_epochs": round(ema_tau_epochs, 3),
@@ -473,10 +589,12 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             if "weight_decay" in keys:
                 for group in opt.param_groups:
                     if float(group.get("weight_decay", 0.0)) > 0.0:
-                        group["weight_decay"] = float(cfg["weight_decay"])
+                        group["weight_decay"] = float(cfg["weight_decay"]) * float(group.get("wd_mult", 1.0))
             if "momentum" in keys:
                 for group in opt.param_groups:
-                    if "betas" in group:
+                    if group.get("use_muon") and "momentum" in group:
+                        group["momentum"] = float(cfg["momentum"])
+                    elif "betas" in group:
                         group["betas"] = (float(cfg["momentum"]), group["betas"][1])
                     elif "momentum" in group:
                         group["momentum"] = float(cfg["momentum"])
@@ -484,6 +602,8 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                 ema.decay, ema.tau = float(cfg["ema_decay"]), float(cfg["ema_tau"])
             if "o2o_detach" in keys:
                 model.head.detach_o2o = bool(cfg["o2o_detach"])
+            if "o2o_body_grad_scale" in keys and hasattr(model.head, "o2o_body_grad_scale"):
+                model.head.o2o_body_grad_scale = float(cfg["o2o_body_grad_scale"])
             aug_keys = keys - LIVE_KEYS_SET
             if augmenter is not None and aug_keys:
                 augmenter.hyp.update({key: aug_hyp[key] for key in aug_keys})
@@ -493,14 +613,18 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         must_rebuild, mosaic_closed, mosaic_p = _epoch_data_plan(
             epoch, ds.imgsz, want, mosaic_closed, plan.close_from, aug_hyp.get("mosaic", 0.0),
         )
-        if must_rebuild or live_rebuild:
+        # The loader's workers are persistent, so a new share reaches them only through a rebuild.
+        dense_now = plan.dense_p(epoch) if mosaic_version >= 3 and gpu_aug else 0.0
+        dense_changed = dense_now != dense_p
+        dense_p = dense_now
+        if must_rebuild or live_rebuild or dense_changed:
             # Stop the old loader's persistent workers before the new ones
             # start, and give cached blocks sized for the old image size back:
             # on Windows a full GPU spills into system RAM instead of failing,
             # so the allocator would never free them by itself.
             _close_loader(loader)
             batches = loader = None
-            ds, loader = rebuild(want, mosaic_p)
+            ds, loader = rebuild(want, mosaic_p, close_overlays=mosaic_closed)
             if dev.type == "cuda":
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -509,9 +633,14 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
                 preview.train = ds
             if augmenter is not None:
                 augmenter.imgsz = int(want)
+                if mosaic_closed:
+                    augmenter.hyp["mixup"] = 0.0
+                    augmenter.hyp["copy_paste"] = 0.0
             note = [f"imgsz {want}"]
+            if dense_changed:
+                note.append(f"nine-image mosaics {dense_now:.2f}")
             if mosaic_closed and not was_closed:
-                note.append("mosaic closed")
+                note.append("mosaic/mixup/copy_paste closed")
             log_event(f"epoch {epoch}: {', '.join(note)}")
         ds.set_epoch(epoch - 1)
         quality = _epoch_ramp(epoch - 1, cfg["quality_start_epoch"], cfg["quality_warmup_epochs"])
@@ -553,6 +682,9 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             sums = row if sums is None else sums + row
             step_i += 1
             gstep += 1
+            if step_i == 1 and use_compile and (time.perf_counter() - t_ep) > 3.0:
+                # Exclude the one-time step-1 torch.compile latency from the live epoch rate/ETA projection.
+                t_ep = time.perf_counter() - 0.25
             bar.update(1)
             if step_i % 50 == 0:
                 bar.set_postfix(loss=f"{float(row[0]):.3f}", cls=f"{float(row[1]):.3f}", box=f"{float(row[2]):.3f}", lr=f"{lr_now:.1e}")
@@ -603,13 +735,10 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         is_best = False
         val_metrics = None
         if val_loader is not None and _should_validate(epoch, epochs, cfg["val_period"], plan.val_final):
-            from fotonet.engine.validation import evaluate_detection_model
             val_model.load_state_dict(ema.deploy_state(model), strict=True)
-            val_metrics = evaluate_detection_model(
-                val_model, val_loader, dev, nc_final, class_names=names, progress=False,
-                amp=bool(cfg["val_amp"]) and dev.type == "cuda",
-                coco_backend="fast" if bool(cfg["fast_val"]) else "pycocotools",
-            )
+            t_val = time.perf_counter()
+            val_metrics = evaluate()
+            entry["val_seconds"] = round(time.perf_counter() - t_val, 3)
             score = float(val_metrics.get(cfg["best_metric"], 0.0))
             entry[cfg["best_metric"]] = round(score, 4)
             for key in ("mAP50", "mAP75"):
@@ -653,8 +782,12 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             for key, value in entry.items():
                 if isinstance(value, (int, float)) and key != "epoch":
                     writer.add_scalar(key, value, epoch)
+        if averager is not None and averager.due(epoch, epochs, cfg["ema_average_last"], cfg["ema_average_every"]):
+            averager.add(ema.deploy_state(model))
         resume_state = {"rng": capture_rng_state(augmenter), "best_epoch": best_epoch, "epochs": epochs,
                         "parts": train_parts}
+        if averager is not None:
+            resume_state["ema_average"] = averager.state()
         if scaler is not None:
             resume_state["scaler"] = scaler.state_dict()
         save_payload(
@@ -695,6 +828,23 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
             break
         epoch += 1
 
+    average_result = None
+    if averager is not None and averager.count > 1 and val_loader is not None:
+        average_state = averager.result()
+        val_model.load_state_dict(average_state, strict=True)
+        average_metrics = evaluate()
+        score = float(average_metrics.get(cfg["best_metric"], 0.0))
+        avg_path = os.path.join(out_dir, f"{model.model_id}_avg.pt")
+        save_payload(
+            model, avg_path, epoch=min(epoch, epochs), best_map=score, inference_only=False, state=average_state,
+            names=names, extra={"metric": cfg["best_metric"], "metric_value": score, "weights_source": "ema_average",
+                                "ema_average_count": averager.count, "parts": train_parts},
+        )
+        average_result = {"checkpoint": avg_path, "snapshots": averager.count, cfg["best_metric"]: round(score, 4),
+                          "best_single_epoch": round(best_map, 4)}
+        _write_json(os.path.join(out_dir, "ema_average.json"), average_result)
+        log_event(f"EMA average of {averager.count} snapshots: {cfg['best_metric']} {score:.4f} "
+                  f"(best single epoch {best_map:.4f})")
     if prof.enabled and not profile_written and prof.summary()["steps"]:
         # The run ended before profile_steps were collected; keep what there is.
         summary = prof.write(os.path.join(out_dir, "profile.json"))
@@ -730,6 +880,7 @@ def _train(model, model_id, data, recipe, imgsz, resume, **kwargs):
         "out_dir": out_dir,
         "epochs": epochs,
         "stopped_early": stopped_early,
+        "ema_average": average_result,
     }
     _fire(callbacks, "on_train_end", dict(result))
     return result

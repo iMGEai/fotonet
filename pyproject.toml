@@ -60,7 +60,7 @@ include = ["fotonet*"]
 exclude = ["datasets*", "dev-tools*", "tools*", "logs*", "runs*", "tests*", "fotonet.studio*", "fotonet.experimental*"]
 
 [tool.setuptools.package-data]
-"fotonet.config.models" = ["*.yaml", "v1_1/*.yaml"]
+"fotonet.config.models" = ["*.yaml", "v1_1/*.yaml", "v2/*.yaml"]
 "fotonet.config.recipes" = ["*.yaml"]
 
 [tool.setuptools.dynamic]

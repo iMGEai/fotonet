@@ -204,7 +204,7 @@ class WSDScheduler:
             self.it = it
         lr = self.lr_at(it)
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * float(group.get("lr_mult", 1.0))
         return lr
 
     def trigger_early_decay(self, at_iter: int) -> bool:

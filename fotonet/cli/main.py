@@ -109,20 +109,20 @@ def main(argv=None):
         return _model_free_task(task, args)
     model_name = args.pop("model", None)
     if not model_name:
-        raise SystemExit("Every task requires model=fotonete or model=path/to/checkpoint.pt.")
+        raise SystemExit("Every task requires model=fotonetn, model=fotonet2n, or model=path/to/checkpoint.pt.")
     explicit_imgsz = "imgsz" in args
     imgsz = _parse_imgsz(args.pop("imgsz", 640))
 
     # One loader for every model reference. ``Fotonet`` recognizes v1.1 ids
     # and v1.1 checkpoints itself, reading each file once with the safe
     # tensor-only unpickler.
-    from fotonet.versions import is_v11_model
+    from fotonet.versions import is_v11_model, is_v2_model
 
     constructor = {}
     if "device" in args:
         # The model is built on it; val() and info() take no device of their own.
         constructor["device"] = args.pop("device")
-    if is_v11_model(model_name) and "pretrained" in args:
+    if (is_v11_model(model_name) or is_v2_model(model_name)) and "pretrained" in args:
         # For a v1.1 id this chooses published weights vs. an untrained build.
         constructor["pretrained"] = bool(args.pop("pretrained"))
     if task in ("train", "info", "benchmark"):
@@ -252,7 +252,7 @@ def main(argv=None):
         path = args.pop("path", f"fotonet_export.{fmt}")
         out = model.export(path=path, format=fmt, imgsz=imgsz, **args)
         print(f"exported={out['artifact']}")
-        print(f"metadata={out['metadata']}")
+        print(f"metadata={out.get('metadata_path', out['metadata'])}")
 
 
 def _dry_run_data(data):

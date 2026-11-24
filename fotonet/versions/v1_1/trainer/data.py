@@ -68,7 +68,12 @@ class _TrainDataset(GeometryMixin, DetectionDataset):
         hyp = self.augment_hyp
         use_mosaic = self._mosaic_enabled() and np.random.random() < hyp.get("mosaic", 0.0)
         pre_zoom = False
-        if use_mosaic and int(getattr(self, "mosaic_version", 1) or 1) >= 2:
+        if use_mosaic and int(getattr(self, "mosaic_version", 1) or 1) >= 3:
+            from fotonet.data.augmentations.compose import load_mosaic_v3
+
+            img, boxes, labels = load_mosaic_v3(self, idx, self.imgsz)
+            pre_zoom = True
+        elif use_mosaic and int(getattr(self, "mosaic_version", 1) or 1) >= 2:
             from fotonet.data.augmentations.compose import load_mosaic_v2
 
             img, boxes, labels = load_mosaic_v2(self, idx, self.imgsz)
@@ -157,7 +162,12 @@ def _load_data_cfg(data):
         raise SystemExit("The data config needs a 'train' source.")
     sources = train_source if isinstance(train_source, (list, tuple)) else [train_source]
     if any(isinstance(item, dict) or str(item).lower().endswith(".json") for item in sources):
-        raise SystemExit("v1.1 training reads YOLO-format image folders; COCO JSON train sources are not supported.")
+        # COCO annotations are read as they are (no text labels): one mapping, so the class list and
+        # the crowd regions come from one file.
+        if len(sources) != 1 or not isinstance(sources[0], dict) or not sources[0].get("annotations"):
+            raise SystemExit("A COCO train source is one mapping: {format: coco, images: <folder>, "
+                             "annotations: <instances json>}.")
+        train_source = dict(sources[0])
     names = cfg.get("names")
     nc = cfg.get("nc")
     nc = int(nc) if nc is not None else (len(names) if names else 80)
@@ -169,6 +179,37 @@ def _sample_fraction(source, fraction, seed=0):
     paths = expand_image_sources(source)
     count = max(1, int(round(len(paths) * float(fraction))))
     return sorted(random.Random(int(seed)).sample(paths, count))
+
+
+def _load_coco_train(source, nc, crowd_rows):
+    """Image list and label cache of a COCO train source (``{images, annotations}``), read as it is."""
+    from fotonet.data.coco import read_coco_labels
+
+    labels = read_coco_labels(source["annotations"], source.get("images"), crowd_rows=crowd_rows)
+    if not labels.paths:
+        raise SystemExit(f"No image of {source['annotations']} was found under {source.get('images')}.")
+    if nc is not None and len(labels.names) != int(nc):
+        raise SystemExit(f"{source['annotations']} has {len(labels.names)} categories; the data config says nc={nc}.")
+    return labels
+
+
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _subset_labels(paths, cache, keep):
+    """``(paths, cache)`` for the images in ``keep`` (a list of paths), re-indexed from zero."""
+    index_of = {_path_key(path): index for index, path in enumerate(paths)}
+    return list(keep), {new: cache[index_of[_path_key(path)]] for new, path in enumerate(keep)}
+
+
+def _align_labels(image_files, paths, cache):
+    """The label cache in the order a dataset lists its images (it may sort or normalize the paths)."""
+    keys = [_path_key(path) for path in image_files]
+    if keys == [_path_key(path) for path in paths[:len(keys)]]:
+        return cache
+    index_of = {_path_key(path): index for index, path in enumerate(paths)}
+    return {new: cache[index_of[key]] for new, key in enumerate(keys)}
 
 
 def _epoch_data_plan(epoch, current_imgsz, wanted_imgsz, mosaic_closed, close_from, mosaic):

@@ -98,7 +98,7 @@ def inference_state_dict(ckpt):
 
 
 def _is_training_only(key):
-    return str(key).startswith(TRAINING_ONLY_PREFIXES)
+    return str(key).startswith((*TRAINING_ONLY_PREFIXES, "head.cdn_label_emb."))
 
 
 def load_weights(model, state):
@@ -128,8 +128,17 @@ def save_payload(model, path, *, epoch=None, ema=None, optimizer=None, best_map=
     if inference_only:
         state = {key: value for key, value in state.items() if not _is_training_only(key)}
     if half:
-        state = {key: value.half() if torch.is_tensor(value) and value.is_floating_point() else value
-                 for key, value in state.items()}
+        def _safe_half(key: str, value):
+            if not (torch.is_tensor(value) and value.is_floating_point()):
+                return value
+            # Keep 1-D norm/bias/running_var buffers (and any out-of-range tensor) in FP32 to prevent FP16 inf/underflow.
+            if value.ndim <= 1 or "running_" in str(key):
+                return value
+            if value.numel() > 0 and float(value.detach().abs().max().item()) > 65000.0:
+                return value
+            return value.half()
+
+        state = {key: _safe_half(key, value) for key, value in state.items()}
     if names is None:
         names = getattr(model, "class_names", None)
     payload = {
@@ -162,7 +171,9 @@ def validate_v11_metadata(metadata, expected_format):
     """Check a v1.1 export sidecar. This contract does not use the v1 runtime fields."""
     if not isinstance(metadata, dict):
         raise RuntimeError("v1.1 artifact metadata must be a JSON object.")
-    if not str(metadata.get("graph_version", "")).startswith("1.1"):
+    from fotonet.versions import shares_v11_contract
+
+    if not shares_v11_contract(metadata.get("graph_version")):
         raise RuntimeError("v1.1 artifact metadata has the wrong graph version.")
     if metadata.get("format") not in (None, expected_format):
         raise RuntimeError(
@@ -201,8 +212,12 @@ def v11_metadata(model_api, fmt, imgsz, batch, dynamic, half, extra=None):
     if isinstance(names, dict):
         names = {str(key): str(value) for key, value in names.items()}
     strides = [int(s) for s in getattr(getattr(model, "head", None), "strides", FEATURE_STRIDES)]
+    num_queries = getattr(getattr(model, "head", None), "num_queries", None)
+    anchor_count = int(num_queries) if num_queries is not None else _anchor_count(h, w, strides)
     data = {
-        "graph_version": GRAPH_VERSION,
+        # The graph that was exported: a v2 model shares this sidecar and names its own version.
+        "graph_version": str(getattr(model, "graph_version", None) or getattr(model_api, "graph_version", None)
+                             or GRAPH_VERSION),
         "format": fmt,
         "model_id": str(model_api.model_id),
         "architecture_fingerprint": str(model_api.architecture_fingerprint),
@@ -214,7 +229,7 @@ def v11_metadata(model_api, fmt, imgsz, batch, dynamic, half, extra=None):
         "half": bool(half),
         "strides": strides,
         "reg_max": 1,
-        "anchor_count": _anchor_count(h, w, strides),
+        "anchor_count": anchor_count,
         "nms_free": True,
         "input_layout": "NCHW",
         "input_color": "RGB",

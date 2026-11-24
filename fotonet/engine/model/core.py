@@ -27,7 +27,7 @@ class Fotonet(
     ``Fotonet('path/to.pt')`` for a supported local checkpoint. Use
     ``Fotonet()`` for an untrained architecture.
     """
-    MODELS = (*available_models(), "fotonetn", "fotonets", "fotonetm", "fotonetl")
+    MODELS = (*available_models(), "fotonetn", "fotonets", "fotonetm", "fotonetl", "fotonet2n")
     CHECKPOINT_FORMAT = 1
     TRAINING_PROTOCOL = 1
 
@@ -100,6 +100,6 @@ class Fotonet(
             return
 
         else:
-            v11_ids = ("fotonetn", "fotonets", "fotonetm", "fotonetl")
+            v11_ids = ("fotonetn", "fotonets", "fotonetm", "fotonetl", "fotonet2n")
             valid = ", ".join((*available_models(), *v11_ids))
             raise ValueError(f"Unknown model '{model_path}'. Use one of: {valid}, a YAML file, or a checkpoint.")

@@ -168,6 +168,16 @@ def _verify_onnx_runtime(path, samples, *, prefer_cuda=False, logits=0):
             raise RuntimeError(f"ONNX Runtime parity check failed for {label} input (max abs error={max_error}).")
 
 
+def _export_sample(batch, h, w, device, dtype):
+    """Deterministic non-uniform [0, 1] image tensor for export tracing and parity checks.
+
+    Avoids exact spatial score ties in Top-K sparse query heads (e.g. fotonet v2) that occur
+    on all-zero inputs and cause arbitrary query-order permutations between runtimes.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    return torch.rand((batch, 3, h, w), generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+
+
 def export_onnx(model_api, path, imgsz=640, batch=1, dynamic=False, half=False,
                 simplify=True, opset=17, device=None, verify=True):
     device = device or model_api.device
@@ -188,22 +198,27 @@ def export_onnx(model_api, path, imgsz=640, batch=1, dynamic=False, half=False,
         "do_constant_folding": True,
     }
     with _export_model_state(model_api, device, half) as (model, use_half), torch.no_grad():
-        dummy = torch.zeros(batch, 3, h, w, device=device, dtype=torch.float16 if use_half else torch.float32)
+        dummy = _export_sample(batch, h, w, device, torch.float16 if use_half else torch.float32)
         reference = model(dummy).detach().float().cpu().numpy()
         samples = [(f"{h}x{w}", dummy, reference)]
         if dynamic:
             # Exercise batch and non-stride-aligned H/W changes together.
             # This catches frozen trace-time batch, resize, grid, and
             # pad/unpad branches rather than merely testing one symbolic axis.
-            dynamic_dummy = torch.zeros(
-                batch + 1, 3, h + 1, w + 3, device=device, dtype=dummy.dtype
-            )
+            dynamic_dummy = _export_sample(batch + 1, h + 1, w + 3, device, dummy.dtype)
             dynamic_reference = model(dynamic_dummy).detach().float().cpu().numpy()
             samples.append((f"B{batch + 1}_{h + 1}x{w + 3}", dynamic_dummy, dynamic_reference))
+        static_flag = not dynamic
+        for _mod in model.modules():
+            _mod._static_export = static_flag
         try:
-            torch.onnx.export(model, dummy, path, dynamo=False, **export_kwargs)
-        except TypeError:
-            torch.onnx.export(model, dummy, path, **export_kwargs)
+            try:
+                torch.onnx.export(model, dummy, path, dynamo=False, **export_kwargs)
+            except TypeError:
+                torch.onnx.export(model, dummy, path, **export_kwargs)
+        finally:
+            for _mod in model.modules():
+                _mod._static_export = False
 
     try:
         import onnx
@@ -250,7 +265,7 @@ def export_torchscript(model_api, path, imgsz=640, batch=1, half=False, device=N
         _export_model_state(model_api, device, half) as (model, use_half),
         torch.no_grad(),
     ):
-        dummy = torch.zeros(batch, 3, h, w, device=device, dtype=torch.float16 if use_half else torch.float32)
+        dummy = _export_sample(batch, h, w, device, torch.float16 if use_half else torch.float32)
         traced = torch.jit.trace(model, dummy, check_trace=bool(verify))
         reference = model(dummy)
         candidate = traced(dummy)
@@ -259,7 +274,7 @@ def export_torchscript(model_api, path, imgsz=640, batch=1, half=False, device=N
         # Batch dynamism is independent of H/W dynamism.  Verify and record it
         # even for a static-H/W export, so the runtime never guesses whether a
         # Python trace froze the example batch dimension.
-        batch_probe = torch.zeros(batch + 1, 3, h, w, device=device, dtype=dummy.dtype)
+        batch_probe = _export_sample(batch + 1, h, w, device, dummy.dtype)
         try:
             batch_reference = model(batch_probe)
             batch_candidate = traced(batch_probe)
@@ -273,9 +288,7 @@ def export_torchscript(model_api, path, imgsz=640, batch=1, half=False, device=N
             # Exercise tensor-derived pad/resize/grid operations rather than
             # merely serializing them. A non-stride-aligned rectangle catches
             # frozen anchor-grid and unpadding errors.
-            dynamic_dummy = torch.zeros(
-                batch + 1, 3, h + 1, w + 3, device=device, dtype=dummy.dtype
-            )
+            dynamic_dummy = _export_sample(batch + 1, h + 1, w + 3, device, dummy.dtype)
             dynamic_reference = model(dynamic_dummy)
             dynamic_candidate = traced(dynamic_dummy)
             if dynamic_candidate.shape != dynamic_reference.shape or not torch.allclose(
@@ -396,7 +409,7 @@ def export_coreml(model_api, path, imgsz=640, batch=1, half=True, device=None, c
     batch = _batch_size(batch)
     h, w = _imgsz_pair(imgsz)
     with _export_model_state(model_api, device, half) as (model, use_half), torch.no_grad():
-        dummy = torch.zeros(batch, 3, h, w, device=device, dtype=torch.float16 if use_half else torch.float32)
+        dummy = _export_sample(batch, h, w, device, torch.float16 if use_half else torch.float32)
         traced = torch.jit.trace(model, dummy, check_trace=True)
 
     requested = str(coreml_format or "auto").lower()

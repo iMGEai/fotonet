@@ -83,8 +83,10 @@ class GeometryMixin:
     mosaic_buffer = 0
     MOSAIC_BUFFER_WARM = 16
     # aug.mosaic version: 1 crops the canvas to its center before the GPU zoom; 2 zooms the whole
-    # canvas in the worker (mosaic_geometry_v2).
+    # canvas in the worker (mosaic_geometry_v2); 3 adds the nine-image form (mosaic_geometry_v3).
     mosaic_version = 1
+    # Share of mosaics that use nine images instead of four (aug.mosaic@1.3 only).
+    mosaic_dense = 0.0
 
     def _header(self, idx):
         cache = self.__dict__.setdefault("_header_cache", {})
@@ -168,7 +170,10 @@ class GeometryMixin:
         return [part], boxes, labels
 
     def _mosaic_geometry_once(self, idx, size):
-        if int(getattr(self, "mosaic_version", 1) or 1) >= 2:
+        version = int(getattr(self, "mosaic_version", 1) or 1)
+        if version >= 3:
+            return mosaic_geometry_v3(self, idx, size)
+        if version >= 2:
             return mosaic_geometry_v2(self, idx, size)
         return mosaic_geometry_v1(self, idx, size)
 
@@ -397,6 +402,71 @@ def mosaic_geometry_v2(dataset, idx, size):
     labels = np.concatenate(all_labels, 0)
     area = np.concatenate(all_areas, 0)
     boxes = clip_boxes_xyxy(boxes, size, size)
+    bw, bh = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+    visible = (bw * bh) / np.maximum(area, 1e-6)
+    keep = (bw > 2.0) & (bh > 2.0) & (visible > 0.1) & np.isfinite(boxes).all(axis=1)
+    boxes, labels = boxes[keep], labels[keep]
+    if len(boxes):
+        boxes, labels = sanitize_boxes_xywhn(xyxy_to_xywhn(boxes, size, size), labels)
+    else:
+        boxes, labels = np.zeros((0, 4), np.float32), np.zeros((0,), np.int64)
+    return specs, boxes, labels, source_count
+
+
+def mosaic_geometry_v3(dataset, idx, size):
+    """``aug.mosaic@1.3``: ``aug.mosaic@1.2``, or with probability ``mosaic_dense`` a nine-image mosaic.
+
+    One-to-one heads get one positive per object, so more objects per image is more supervision. The
+    dense form cuts the 2x canvas into a jittered 3x3 grid, fills each cell with an image resized to
+    3/4 of the output size (``dense_mosaic_cells``), and applies the same zoom and shift as
+    ``aug.mosaic@1.2``. The sample's own image sits in the center cell, the one a zoom-in keeps.
+    Only images that reach the output window are decoded.
+    """
+    from fotonet.data.augmentations.compose import DENSE_TILE_SCALE, dense_mosaic_cells, dense_tile_rect
+
+    if random.random() >= float(getattr(dataset, "mosaic_dense", 0.0) or 0.0):
+        return mosaic_geometry_v2(dataset, idx, size)
+    hyp = dataset.augment_hyp
+    scl = float(hyp.get("scale", 0.0))
+    trn = float(hyp.get("translate", 0.0))
+    k = random.uniform(max(1.0 - scl, 0.05), 1.0 + scl)
+    tx = random.uniform(-trn, trn) * size
+    ty = random.uniform(-trn, trn) * size
+    tile = max(int(round(size * DENSE_TILE_SCALE)), 1)
+    cells = dense_mosaic_cells(size)
+    indices = [int(dataset.sample_index()) for _ in cells]
+    indices[len(cells) // 2] = idx
+    specs, all_boxes, all_labels, all_areas = [], [], [], []
+    source_count = 0
+    for cell, j in zip(cells, indices):
+        h0, w0, is_jpeg = dataset._header(j)
+        h, w = _resized_shape(h0, w0, tile)
+        x1a, y1a, x2a, y2a, x1b, y1b = dense_tile_rect(cell, w, h)
+        boxes, labels = dataset._labels(j)
+        source_count += len(labels)
+        hs, ws = max(int(round(h * k)), 1), max(int(round(w * k)), 1)
+        fx, fy = ws / w, hs / h
+        ox = int(round(k * (x1a - x1b - size) + size * 0.5 + tx))
+        oy = int(round(k * (y1a - y1b - size) + size * 0.5 + ty))
+        ax1, ax2 = ox + int(round(x1b * fx)), ox + int(round((x1b + x2a - x1a) * fx))
+        ay1, ay2 = oy + int(round(y1b * fy)), oy + int(round((y1b + y2a - y1a) * fy))
+        dx1, dx2, dy1, dy2 = max(ax1, 0), min(ax2, size), max(ay1, 0), min(ay2, size)
+        if dx2 > dx1 and dy2 > dy1:
+            src = (dy1 - oy, dy2 - oy, dx1 - ox, dx2 - ox)
+            specs.append((j, is_jpeg, (h, w), (hs, ws), src, (dy1, dy2, dx1, dx2), None, False))
+        if len(boxes):
+            xyxy = xywhn_to_xyxy(boxes, w, h)
+            area = np.maximum(xyxy[:, 2] - xyxy[:, 0], 0.0) * np.maximum(xyxy[:, 3] - xyxy[:, 1], 0.0) * fx * fy
+            xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], x1b, x1b + (x2a - x1a)) * fx + ox
+            xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], y1b, y1b + (y2a - y1a)) * fy + oy
+            all_boxes.append(xyxy)
+            all_labels.append(labels)
+            all_areas.append(area)
+    if not all_boxes:
+        return specs, np.zeros((0, 4), np.float32), np.zeros((0,), np.int64), source_count
+    boxes = clip_boxes_xyxy(np.concatenate(all_boxes, 0), size, size)
+    labels = np.concatenate(all_labels, 0)
+    area = np.concatenate(all_areas, 0)
     bw, bh = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
     visible = (bw * bh) / np.maximum(area, 1e-6)
     keep = (bw > 2.0) & (bh > 2.0) & (visible > 0.1) & np.isfinite(boxes).all(axis=1)

@@ -1,0 +1,83 @@
+# FOTONET v1.3 head re-fit: train only the deployed head on the features of a finished v1.1 nano checkpoint.
+# Start from a checkpoint that still has its training head:
+#   fotonet train model=<checkpoint.pt> data=<data.yaml> recipe=fotonetn_head_refit_v13
+# The backbone, the neck and the training head stay frozen, BatchNorm statistics included.
+
+model: fotonetn
+pretrained: true
+resume: false
+trainer: "1.3"
+
+train:
+  epochs: 15
+  imgsz: 640
+  nbs: 128
+  batch: 16
+  workers: 4
+  close_mosaic: 15
+  head_refit: true
+  out_dir: runs/train
+  lr_scheduler: cosine
+  grad_clip: 10.0
+  val_period: 1
+  val_final_epochs: 0
+  val_batch: 32
+  val_workers: 4
+  val_fused: true
+  best_metric: mAP50_95
+  probe_period: 5
+  probe_images: 1000
+  preview_minutes: 0.0
+  forecast: false
+
+optimizer:
+  name: adamw
+  lr0: 0.0002
+  lrf: 0.005
+  weight_decay: 0.05
+  warmup_epochs: 0
+  ema_decay: 0.999
+  ema_tau: 200
+
+augment:
+  mosaic: 0.0
+  mixup: 0.0
+  copy_paste: 0.0
+  scale: 0.5
+  fliplr: 0.5
+  flipud: 0.0
+  degrees: 0.0
+  shear: 0.0
+  translate: 0.071
+  hsv_h: 0.014
+  hsv_s: 0.645
+  hsv_v: 0.566
+  bgr: 0.0
+
+loss:
+  w_box: 7.5
+  w_dfl: 0.0
+  w_o2o: 1.0
+  w_cons: 0.0
+  o2o_cls: bce
+  o2o_q_gamma: 1.0
+  w_runner_up: 1.5
+  o2o_prior_epochs: 0
+  o2o_distill: 0.5
+
+matcher:
+  alpha: 0.5
+  beta: 6.0
+  topk: 8
+  mmax: 160
+  slack_cells: 0.75
+  o2o_topk: 1
+  o2o_metric: consistent
+  o2o_beta: 2.0
+  o2o_center_prior: 5.0
+  o2m_target: iou
+
+smoke_limits:
+  epochs: 1
+  max_images: 512
+  imgsz: 640

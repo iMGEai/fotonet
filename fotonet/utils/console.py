@@ -275,6 +275,9 @@ class AgyProgressBar:
         with self._lock:
             self.current += n
             now = time.time()
+            if self.current == n and (now - self.start_time) > 3.0 and len(self._step_window) == 1:
+                # Exclude one-time step-1 compilation warmup from the sliding window rate EMA.
+                self._step_window.clear()
             self._step_window.append((now, self.current))
             if len(self._step_window) >= 2:
                 t0, c0 = self._step_window[0]

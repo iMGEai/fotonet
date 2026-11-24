@@ -7,15 +7,16 @@
 
 ## Models
 
-| Model | Generation | Parameters | Compute (`640 × 640`) | Status |
-| --- | --- | --- | --- | --- |
-| `fotonetn` | v1.1 (UltraDense) | 2.85M | 6.95 GFLOPs | Available |
-| `fotonets` | v1.1 (UltraDense) | 11.49M | 27.43 GFLOPs | Architecture in package, weights coming soon |
-| `fotonetm` | v1.1 (UltraDense) | 22.23M | 63.38 GFLOPs | Architecture in package, weights coming soon |
-| `fotonetl` | v1.1 (UltraDense) | 70.32M | 161.51 GFLOPs | Architecture in package, weights coming soon |
-| `fotonete` | v1 | 1.70M | 5.20 GFLOPs | Available |
+| Model | Generation | Parameters | Compute (`640 × 640`) | COCO mAP50-95 | Status |
+| --- | --- | --- | --- | --- | --- |
+| `fotonet2n` | v2 (Hi Bird) | 2.69M | 6.41 GFLOPs | 37.5 | Available |
+| `fotonetn` | v1.1 (UltraDense) | 2.85M | 6.95 GFLOPs | 32.1 | Available |
+| `fotonets` | v1.1 (UltraDense) | 11.49M | 27.43 GFLOPs | — | Architecture in package |
+| `fotonetm` | v1.1 (UltraDense) | 22.23M | 63.38 GFLOPs | — | Architecture in package |
+| `fotonetl` | v1.1 (UltraDense) | 70.32M | 161.51 GFLOPs | — | Architecture in package |
+| `fotonete` | v1 | 1.70M | 5.20 GFLOPs | 17.1 | Available |
 
-`fotonetn` now loads weights retrained with the 1.2 trainer: 32.1 mAP50-95 on COCO val2017, up from 29.9, with the same model, size and speed. The first weights stay in the release as `fotonetn-ex.pt`. See [published weights](docs/model-zoo.md#published-weights) and [trainer 1.2](docs/training.md#trainer-12).
+`fotonet2n` (Hi Bird, fotonet 2.0) reaches **37.5 mAP50-95** (55.6 mAP50, 40.0 mAP75) on COCO val2017 from a 300-epoch from-scratch single-GPU run in a 5.98 MB Apache-2.0 checkpoint with zero deployed `BatchNorm2d` layers and fixed `[B, 300, nc+4]` NMS-free outputs. `fotonetn` stays available at 32.1 mAP50-95 (`fotonetn-ex.pt` keeps the first 29.9 weights). See [published weights](docs/model-zoo.md#published-weights) and [trainer 2.0](docs/training.md#trainer-20).
 
 ## Install
 
@@ -38,11 +39,11 @@ Load the released checkpoint and run inference from Python:
 ```python
 from fotonet import Fotonet
 
-model = Fotonet("fotonetn")
+model = Fotonet("fotonet2n")
 results = model.predict("image.jpg", conf=0.25, imgsz=640)
 
 for detection in results[0].boxes:
-    print(detection.cls, detection.conf, detection.xyxy)
+    print(detection.cls, detection.conf, detection.xyxy)  # pixel corners (x1, y1, x2, y2)
 ```
 
 For a BGR frame from OpenCV:
@@ -58,21 +59,21 @@ Training uses a YAML dataset configuration and writes checkpoints to a local run
 
 ```bash
 fotonet train \
-  model=fotonetn \
+  model=fotonet2n \
   data=path/to/data.yaml \
   epochs=100 \
   batch=16 \
   imgsz=640 \
-  run_dir=runs/fotonetn
+  run_dir=runs/fotonet2n
 ```
 
 Resume an interrupted run:
 
 ```bash
 fotonet train \
-  model=fotonetn \
+  model=fotonet2n \
   data=path/to/data.yaml \
-  resume=runs/fotonetn/fotonet_last.pt
+  resume=runs/fotonet2n/fotonet2n_last.pt
 ```
 
 Weights and training outputs are not stored in the Git repository.
@@ -82,10 +83,10 @@ Weights and training outputs are not stored in the Git repository.
 ```python
 from fotonet import Fotonet
 
-model = Fotonet("fotonetn")
+model = Fotonet("fotonet2n")
 output = model.export(
     format="onnx",
-    path="exports/fotonetn.onnx",
+    path="exports/fotonet2n.onnx",
     imgsz=640,
 )
 print(output["artifact"])

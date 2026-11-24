@@ -1,10 +1,11 @@
 # Quick Start
 
+`Fotonet("fotonet2n")` loads `fotonet2n.pt` from the `v2` GitHub release,
 `Fotonet("fotonetn")` loads `fotonetn.pt` from the `v1.1` GitHub release, and
 `Fotonet("fotonete")` loads `fotonete.pt` from the `v1` release. Each checkpoint
-is downloaded once and cached locally; neither is bundled in the Python package.
+is downloaded once and cached locally; none are bundled in the Python package.
 
-Calling `train()` on either model fine-tunes from those weights. A different
+Calling `train()` on any released model fine-tunes from those weights. A different
 class count keeps the backbone and neck and starts only the class predictors fresh.
 
 ## Construct a Model
@@ -44,7 +45,8 @@ print(result)
 
 ```python
 for box in result.boxes:
-    print(box.cls, box.conf, box.xywh, box.xyxy)
+    print(box.cls, box.conf, box.xywh, box.xyxy)     # pixel coordinates
+    print(box.xywhn, box.xyxyn)                      # normalized 0..1 coordinates
 ```
 
 ## CLI inference

@@ -235,6 +235,17 @@ def build_v1_1_model(model_id: str = "fotonetn", nc: int = 80, imgsz: int = 640,
 
 
 def build_from_config(model_id: str, config: dict, nc: int = None, imgsz: int = None) -> V11Detector:
+    """Rebuild the graph a checkpoint or a live model describes.
+
+    A v2 id is handed to the v2 builder: v2 models run through this trainer and loader, so their
+    checkpoints arrive here too.
+    """
+    from fotonet.versions import is_v2_model
+
+    if is_v2_model(model_id):
+        from fotonet.versions.v2.graph import build_from_config as build_v2_from_config
+
+        return build_v2_from_config(str(model_id).strip().lower(), config, nc=nc, imgsz=imgsz)
     cfg = dict(config or {})
     spec = get_spec(model_id)
     if str(cfg.get("graph_version", GRAPH_VERSION)) != GRAPH_VERSION:

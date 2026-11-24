@@ -5,17 +5,21 @@ table below is the manifest of built-in parts; see ``fotonet.registry``.
 """
 from fotonet.registry import alias, part
 
-from fotonet.data.gpu_loader import mosaic_geometry_v1, mosaic_geometry_v2
+from fotonet.data.gpu_loader import mosaic_geometry_v1, mosaic_geometry_v2, mosaic_geometry_v3
 
 from .assign import matcher_fn, o2o_group_targets, unique_topk
 from .assign_v2 import matcher_fn_v2
 from .ema import _EMA
+from .ema_average import EmaAverager
 from .forecast import forecast as _forecast_part
 from .losses import bbox_ciou, bbox_siou, loss_fn, o2o_branch_loss, quality_focal_loss, varifocal_loss
 from .losses_v2 import loss_fn_v2, o2o_branch_loss_v2
-from .optim import build_v11_optimizer, MuonSGD
+from .losses_v13 import loss_fn_v13
+from .losses_hybrid import HybridTalCriterion
+from .optim import build_v11_optimizer, MuAdamW, MuonSGD
 from .probes import head_matrix, LivePreview
-from .schedulers import _epoch_ramp, _lr_at, _lr_at_v2
+from .schedulers import _epoch_ramp, _lr_at, _lr_at_v2, _lr_at_v3
+from .tal import task_aligned_assign
 
 # name, version, kind, implementation
 _BUILTIN = (
@@ -44,6 +48,15 @@ _BUILTIN = (
     ("probe.head_matrix", "1.2", "probe", head_matrix),
     ("probe.live_preview", "1.2", "probe", LivePreview),
     ("probe.forecast", "1.2", "probe", _forecast_part),
+    # The v1.3 trainer (profile "1.3"). Parts whose math did not change keep their version.
+    ("loss.dual_o2o_o2m", "1.3", "loss", loss_fn_v13),
+    ("aug.mosaic", "1.3", "augment", mosaic_geometry_v3),
+    ("ema.average", "1.3", "ema", EmaAverager),
+    ("sched.lr", "1.3", "schedule", _lr_at_v3),
+    # The v2 trainer (profile "2.0", fotonet2n / Hi Bird).
+    ("assign.tal", "2.0", "assigner", task_aligned_assign),
+    ("loss.tal", "2.0", "loss", HybridTalCriterion),
+    ("optim.muadamw", "2.0", "optimizer", MuAdamW),
 )
 for _name, _version, _kind, _obj in _BUILTIN:
     if getattr(_obj, "part_name", None) is None:
@@ -65,6 +78,7 @@ for _old, _new in _RENAMED:
     alias(_old, _new)
 
 __all__ = [
-    "MuonSGD", "bbox_ciou", "bbox_siou", "build_v11_optimizer", "loss_fn", "matcher_fn", "o2o_branch_loss",
-    "o2o_group_targets", "quality_focal_loss", "unique_topk", "varifocal_loss",
+    "HybridTalCriterion", "MuAdamW", "MuonSGD", "bbox_ciou", "bbox_siou", "build_v11_optimizer",
+    "loss_fn", "matcher_fn", "o2o_branch_loss", "o2o_group_targets", "quality_focal_loss",
+    "unique_topk", "varifocal_loss",
 ]
